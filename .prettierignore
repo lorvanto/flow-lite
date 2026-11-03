@@ -1,0 +1,8 @@
+node_modules/
+dist/
+data/
+coverage/
+.local/
+.deploy/
+.qa/
+package-lock.json

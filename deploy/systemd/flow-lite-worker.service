@@ -1,0 +1,32 @@
+[Unit]
+Description=Flow Lite serial task worker
+Wants=network-online.target
+After=network-online.target flow-lite-api.service docker.service
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=flowlite
+Group=flowlite
+WorkingDirectory=/opt/flow-lite
+Environment=NODE_ENV=production
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+EnvironmentFile=/opt/flow-lite/.env
+ExecStart=/usr/bin/node /opt/flow-lite/server/worker.mjs
+Restart=on-failure
+RestartSec=5s
+TimeoutStartSec=30s
+TimeoutStopSec=45s
+KillMode=mixed
+# Data, logs, temporary SSH keys and SQLite explicitly use private permissions.
+# Direct command jobs use a normal website umask so their new files are readable.
+UMask=0022
+# Docker build limits are configured independently with FLOW_DOCKER_CPUS/MEMORY.
+# Add service-level resource policies only if they fit your local command jobs.
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=flow-lite-worker
+
+[Install]
+WantedBy=multi-user.target

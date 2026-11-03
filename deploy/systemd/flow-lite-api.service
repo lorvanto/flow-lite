@@ -1,0 +1,29 @@
+[Unit]
+Description=Flow Lite API
+After=network.target
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=flowlite
+Group=flowlite
+WorkingDirectory=/opt/flow-lite
+Environment=NODE_ENV=production
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=FLOW_HOST=127.0.0.1
+Environment=FLOW_PORT=3210
+EnvironmentFile=/opt/flow-lite/.env
+ExecStart=/usr/bin/node /opt/flow-lite/server/index.mjs
+Restart=on-failure
+RestartSec=5s
+TimeoutStartSec=30s
+TimeoutStopSec=15s
+KillMode=mixed
+UMask=0077
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=flow-lite-api
+
+[Install]
+WantedBy=multi-user.target

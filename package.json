@@ -1,0 +1,54 @@
+{
+  "name": "flow-lite",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=24.0.0"
+  },
+  "scripts": {
+    "dev": "node scripts/dev.mjs",
+    "dev:server": "node --env-file-if-exists=.env --watch server/index.mjs",
+    "dev:web": "vite --config web/vite.config.js",
+    "build": "vite build --config web/vite.config.js",
+    "start": "node --env-file-if-exists=.env server/index.mjs",
+    "worker": "node --env-file-if-exists=.env server/worker.mjs",
+    "test": "node --test tests/*.test.mjs",
+    "check": "node scripts/check.mjs",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "verify": "npm run check && npm run format:check && npm test && npm run build"
+  },
+  "dependencies": {
+    "@fastify/cookie": "^11.0.0",
+    "@lucide/vue": "^1.66.0",
+    "fastify": "^5.0.0",
+    "vue": "^3.5.0"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-vue": "^6.0.0",
+    "prettier": "3.9.10",
+    "vite": "^7.0.0"
+  },
+  "description": "A self-hosted pipeline for Node.js static builds and PHP or custom SSH commands.",
+  "license": "MIT",
+  "author": "lorvanto",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/lorvanto/flow-lite.git"
+  },
+  "homepage": "https://github.com/lorvanto/flow-lite#readme",
+  "bugs": {
+    "url": "https://github.com/lorvanto/flow-lite/issues"
+  },
+  "keywords": [
+    "ci",
+    "cd",
+    "pipeline",
+    "self-hosted",
+    "nodejs",
+    "vue",
+    "php",
+    "ssh"
+  ]
+}

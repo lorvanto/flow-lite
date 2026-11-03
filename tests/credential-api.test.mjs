@@ -1,0 +1,206 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import fs from 'node:fs/promises';
+import path from 'node:path';
+import os from 'node:os';
+import { getConfig } from '../server/config.mjs';
+import { createApp } from '../server/app.mjs';
+import { encrypt } from '../server/lib/crypto.mjs';
+
+const fixtureKey =
+  '-----BEGIN OPENSSH PRIVATE KEY-----\nfixture-only-private-key-body\n-----END OPENSSH PRIVATE KEY-----\n';
+
+async function fixture(t) {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'flow-credential-api-'));
+  const config = getConfig({
+    dataDir: path.join(root, 'data'),
+    setupToken: 'credential-test-setup-token',
+  });
+  const app = await createApp(config);
+  let cookie;
+  const request = async (method, url, payload) => {
+    const response = await app.inject({ method, url, payload, headers: cookie ? { cookie } : {} });
+    if (response.headers['set-cookie'])
+      cookie = String(response.headers['set-cookie']).split(';')[0];
+    return { code: response.statusCode, body: response.json() };
+  };
+  t.after(async () => {
+    await app.close();
+    await fs.rm(root, { recursive: true, force: true });
+  });
+  assert.equal(
+    (
+      await request('POST', '/api/auth/setup', {
+        username: 'admin',
+        password: 'fixture-admin-password',
+        setupToken: config.setupToken,
+      })
+    ).code,
+    200,
+  );
+  return { root, config, app, request };
+}
+
+function metadataOnly(credential) {
+  assert.equal(Object.hasOwn(credential, 'password'), false);
+  assert.equal(Object.hasOwn(credential, 'privateKey'), false);
+  assert.deepEqual(
+    Object.keys(credential).sort(),
+    ['id', 'name', 'type', 'authType', 'createdAt', 'hasKnownHosts'].sort(),
+  );
+}
+
+test('SSH 密码凭据原样加密保存，API 仅返回认证类型和元数据', async (t) => {
+  const f = await fixture(t);
+  const password = '  fixture-only "quoted" $dollar \\slash  ';
+  const knownHosts = 'example.invalid ssh-ed25519 fixture-only-host-key';
+  const result = await f.request('POST', '/api/credentials', {
+    name: '密码凭据',
+    type: 'ssh',
+    authType: 'password',
+    password,
+    privateKey: fixtureKey,
+    knownHosts,
+  });
+  assert.equal(result.code, 201);
+  const credential = result.body.credential;
+  metadataOnly(credential);
+  assert.equal(credential.authType, 'password');
+  assert.equal(credential.hasKnownHosts, true);
+  const stored = f.app.store.getCredential(credential.id);
+  assert.equal(stored.password, password);
+  assert.equal(stored.authType, 'password');
+  assert.equal(Object.hasOwn(stored, 'privateKey'), false);
+  const raw = f.app.store.db
+    .prepare('SELECT secret FROM credentials WHERE id=?')
+    .get(credential.id).secret;
+  assert.equal(raw.includes(password), false);
+  assert.equal(raw.includes('fixture-only'), false);
+  const list = await f.request('GET', '/api/credentials');
+  assert.equal(list.code, 200);
+  assert.equal(list.body.credentials.length, 1);
+  metadataOnly(list.body.credentials[0]);
+  assert.equal(list.body.credentials[0].authType, 'password');
+});
+
+test('SSH 密码校验拒绝空值、超长与换行，保留合法空格密码', async (t) => {
+  const f = await fixture(t);
+  for (const password of [
+    undefined,
+    null,
+    123,
+    '',
+    'x'.repeat(1025),
+    'fixture\0secret',
+    'fixture\rsecret',
+    'fixture\nsecret',
+  ]) {
+    const result = await f.request('POST', '/api/credentials', {
+      name: '无效密码',
+      type: 'ssh',
+      authType: 'password',
+      password,
+    });
+    assert.equal(result.code, 400);
+    assert.match(result.body.error, /SSH 密码/);
+  }
+  assert.equal(
+    (
+      await f.request('POST', '/api/credentials', {
+        name: '无效类型',
+        type: 'ssh',
+        authType: 'other',
+        password: 'fixture-only',
+      })
+    ).code,
+    400,
+  );
+  assert.equal((await f.request('GET', '/api/credentials')).body.credentials.length, 0);
+  for (const password of ['   ', 'x'.repeat(1024)]) {
+    const result = await f.request('POST', '/api/credentials', {
+      name: '有效密码',
+      type: 'ssh',
+      authType: 'password',
+      password,
+    });
+    assert.equal(result.code, 201);
+    assert.equal(f.app.store.getCredential(result.body.credential.id).password, password);
+    metadataOnly(result.body.credential);
+  }
+});
+
+test('旧私钥凭据缺省 key 认证，历史加密记录无需迁移且不返回私钥', async (t) => {
+  const f = await fixture(t);
+  const result = await f.request('POST', '/api/credentials', {
+    name: '旧私钥',
+    type: 'ssh',
+    privateKey: fixtureKey,
+    password: 'must-not-be-stored',
+  });
+  assert.equal(result.code, 201);
+  const id = result.body.credential.id;
+  assert.equal(result.body.credential.authType, 'key');
+  metadataOnly(result.body.credential);
+  assert.equal(f.app.store.getCredential(id).privateKey, fixtureKey);
+  assert.equal(Object.hasOwn(f.app.store.getCredential(id), 'password'), false);
+
+  // Model a pre-authType credential already present on disk.
+  f.app.store.db
+    .prepare('UPDATE credentials SET secret=? WHERE id=?')
+    .run(encrypt({ privateKey: fixtureKey, knownHosts: '' }, f.config.masterKey), id);
+  assert.equal(f.app.store.getCredential(id).authType, 'key');
+  assert.equal(f.app.store.getCredential(id).privateKey, fixtureKey);
+  const listed = (await f.request('GET', '/api/credentials')).body.credentials[0];
+  assert.equal(listed.authType, 'key');
+  metadataOnly(listed);
+});
+
+test('root 用户可引用密码凭据，仓库和远程项目响应不包含认证秘密', async (t) => {
+  const f = await fixture(t);
+  const password = 'fixture-only-root-password';
+  const id = (
+    await f.request('POST', '/api/credentials', {
+      name: 'root 登录',
+      type: 'ssh',
+      authType: 'password',
+      password,
+    })
+  ).body.credential.id;
+  const command = await f.request('POST', '/api/projects', {
+    type: 'command',
+    name: '远程命令',
+    commands: 'pwd',
+    deploy: {
+      type: 'ssh',
+      host: 'example.invalid',
+      port: 22,
+      user: 'root',
+      root: '/srv/www/fixture',
+      credentialId: id,
+    },
+  });
+  assert.equal(command.code, 201);
+  assert.equal(command.body.project.deploy.user, 'root');
+  assert.equal(command.body.project.deploy.credentialId, id);
+  const node = await f.request('POST', '/api/projects', {
+    name: '仓库密码',
+    repoUrl: 'git@example.invalid:team/web.git',
+    buildCredentialId: id,
+    deploy: { type: 'local', root: path.join(f.root, 'site') },
+  });
+  assert.equal(node.code, 201);
+  assert.equal(node.body.project.buildCredentialId, id);
+  const run = await f.request('POST', `/api/projects/${command.body.project.id}/runs`, {});
+  assert.equal(run.code, 202);
+  for (const body of [
+    command.body,
+    node.body,
+    run.body,
+    (await f.request('GET', '/api/projects')).body,
+  ]) {
+    assert.equal(JSON.stringify(body).includes(password), false);
+    assert.equal(Object.hasOwn(body, 'password'), false);
+    assert.equal(Object.hasOwn(body, 'privateKey'), false);
+  }
+  assert.equal((await f.request('DELETE', `/api/credentials/${id}`)).code, 409);
+});

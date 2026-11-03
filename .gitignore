@@ -1,0 +1,29 @@
+# Dependencies and build output
+node_modules/
+/dist/
+/coverage/
+
+# Runtime data and local configuration
+/data/
+.env
+.env.*
+!.env.example
+*.log
+*.sqlite
+*.sqlite-*
+*.db
+*.db-*
+
+# Private deployment records, credentials, and local verification artifacts
+/.local/
+/.qa/
+/.deploy/
+*.pem
+*.key
+*.p12
+*.pfx
+*.tgz
+
+# Editor and operating-system files
+.DS_Store
+.idea/

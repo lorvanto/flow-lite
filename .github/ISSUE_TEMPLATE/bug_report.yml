@@ -1,0 +1,27 @@
+name: 问题反馈
+description: 报告可复现的问题
+body:
+  - type: markdown
+    attributes:
+      value: 请先移除日志和截图中的密码、令牌、私钥及服务器个人信息。安全漏洞请通过 Security 页面私下报告。
+  - type: textarea
+    id: behavior
+    attributes:
+      label: 实际行为与预期行为
+      description: 描述发生了什么，以及你期望的结果。
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: 复现步骤
+      description: 提供最小复现步骤和脱敏后的相关日志。
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: 运行环境
+      description: Flow Lite 版本或 commit、服务器系统、平台 Node.js 版本、构建版本、任务类型和部署方式。
+    validations:
+      required: true
