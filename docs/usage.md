@@ -41,9 +41,33 @@ API 首次启动时，未指定 `FLOW_SETUP_TOKEN` 会在 `FLOW_DATA_DIR/setup-t
 
 Web 服务器的根目录指向 `/srv/sites/demo/current`。本机发布和 SSH 发布均先准备版本目录，再原子切换符号链接；SSH 目标机预先安装 `sh`、`tar` 等基础工具，不需要运行 Node.js 构建。
 
-## SSH 凭据
+## 仓库与部署凭据
 
-凭据管理支持 SSH 私钥和 SSH 密码。凭据不包含登录用户名：在 SSH 目标中填写用户名，仓库连接则从 SSH Git 地址取得用户名。代码仓库和部署目标分别选择凭据，也可以复用同一个凭据。
+| 用途                | 凭据类型            |
+| ------------------- | ------------------- |
+| 私有 HTTPS Git 仓库 | Git HTTPS 账号密码  |
+| SSH Git 仓库        | SSH 私钥或 SSH 密码 |
+| SSH 发布和远程命令  | SSH 私钥或 SSH 密码 |
+| 公开 HTTPS Git 仓库 | 可以不选择凭据      |
+
+仓库凭据与部署凭据分别配置。HTTPS Git 凭据只供仓库拉取使用，不能用于 SSH 发布；已有 SSH 项目和凭据继续使用原配置。
+
+### Git HTTPS 账号密码
+
+此认证模式需要执行机安装 **Git 2.32 或以上版本**，可通过 `git --version` 检查。SSH 仓库和不选择凭据的公开 HTTPS 仓库继续沿用原有要求。
+
+1. 在凭据管理中添加凭据，选择 **Git HTTPS 账号密码**，填写凭据名称、Git 用户名，以及密码或访问令牌。
+2. 在 Node.js 流水线中填写规范的 HTTPS 克隆地址，例如 `https://git.example.com/team/demo-web.git`。URL 中不要夹带用户名、密码或令牌。
+3. 在仓库凭据中选择刚创建的 HTTPS 凭据。若同时使用 SSH 发布，另选对应 SSH 部署凭据。
+4. 运行流水线，查看检出阶段和后续构建结果。凭据保存后不回显账号、密码或令牌，使用名称区分不同凭据。
+
+**GitHub 不接受账户密码用于 HTTPS Git 操作。** 填写 GitHub 用户名，在密码 / 访问令牌字段填入拥有目标仓库读取权限的个人访问令牌。其他明确允许密码认证的 Git 服务器可填写原密码，是否接受令牌、所需权限和组织授权由对应服务决定。[GitHub 官方认证说明](https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/about-authentication-to-github#https)、[个人访问令牌说明](https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/managing-your-personal-access-tokens)。
+
+账号与密码 / 令牌加密保存在平台数据库中。HTTPS 证书仍须被执行机信任，平台不会自动关闭 TLS 校验；认证检出不自动跟随重定向，仓库迁移后请更新为服务提供的最终克隆地址。此凭据用于检出阶段的 Git 拉取，不传给依赖安装、构建容器或原地命令中的 Git 操作；如果项目在安装依赖时还需访问其他私有仓库，应单独配置相应认证。
+
+### SSH 私钥与密码
+
+SSH 凭据不包含登录用户名：在 SSH 目标中填写用户名，仓库连接则从 SSH Git 地址取得用户名。SSH 代码仓库和 SSH 部署目标分别选择凭据，也可以复用同一个 SSH 凭据。
 
 私钥与密码使用 AES-256-GCM 加密保存，保存后不能从页面再次查看。密码经任务私有的临时文件和 OpenSSH ASKPASS 交给客户端，不写入进程参数或环境变量值；任务结束后清理临时文件。目标 SSH 服务必须允许所选账号与认证方式。
 
@@ -77,7 +101,7 @@ php artisan config:cache
 
 命令直接修改指定目录。本机执行使用平台运行账号，远端执行使用配置的 SSH 账号。此类型不创建 `current` / `releases`，不保存静态产物，也不提供自动回滚。
 
-目标机上 `git pull` 的 Git 认证需要单独配置。平台的 SSH 凭据负责登录服务器，不会自动转交给目标机的 Git 客户端。不要把密码或令牌直接写入命令文本，使用项目环境变量引用。
+目标机上 `git pull` 的 Git 认证需要单独配置。平台的 SSH 凭据负责登录服务器，仓库凭据负责 Node.js 检出阶段；二者都不会自动转交给命令中的 Git 客户端。不要把密码或令牌直接写入命令文本，使用项目环境变量引用。
 
 ## 取消、重试与回滚
 

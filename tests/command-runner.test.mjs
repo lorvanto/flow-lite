@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import os from 'node:os';
+import net from 'node:net';
 import { randomUUID, createHash } from 'node:crypto';
 import { executeCommands } from '../server/runners/command.mjs';
 import { runProcess } from '../server/lib/process.mjs';
@@ -268,19 +269,82 @@ test('mock SSH cancellation sends a second connection to terminate the remote se
     user: 'deploy',
     credentialId,
   };
-  const childScript = `process.on('SIGTERM',()=>{});process.stdout.write('remote started\\n');setTimeout(()=>require('node:fs').writeFileSync(${JSON.stringify(sentinel)},'bad'),2000);setInterval(()=>{},1000)`;
+  const handshake = randomUUID();
+  // The child only writes the sentinel when explicitly probed after cancellation.
+  // A wall-clock timer here races the parent's ability to start cancellation under load.
+  const childScript = `const net=require('node:net');const fs=require('node:fs');const token=${JSON.stringify(handshake)};process.on('SIGTERM',()=>{});const server=net.createServer(socket=>{let input='';socket.setEncoding('utf8');socket.on('data',chunk=>{input+=chunk;let end;while((end=input.indexOf('\\n'))>=0){const command=input.slice(0,end);input=input.slice(end+1);if(command==='ready '+token)socket.write('ready '+token+'\\n');if(command==='probe '+token){fs.writeFileSync(${JSON.stringify(sentinel)},'orphan still running');socket.write('alive '+token+'\\n');}}});socket.on('error',()=>{});});server.listen(0,'127.0.0.1',()=>process.stdout.write('remote ready:'+process.pid+':'+server.address().port+'\\n'));`;
   f.project.commands = `${quote(process.execPath)} -e ${quote(childScript)}`;
   const controller = new AbortController();
   let logs = '';
+  let childPid;
+  let socket;
+  let childClosed = false;
+  let afterCancellation;
+  let resolveAfterCancellation;
+  t.after(() => {
+    // Only clean up a live fixture after a failed assertion; a successful test
+    // must observe the remote cancellation closing the child's own connection.
+    if (!childClosed && childPid) {
+      try {
+        process.kill(childPid, 'SIGKILL');
+      } catch {}
+    }
+    socket?.destroy();
+  });
+  const bounded = async (promise, message) => {
+    let deadline;
+    try {
+      return await Promise.race([
+        promise,
+        new Promise((_, reject) => {
+          deadline = setTimeout(() => reject(new Error(message)), 5000);
+        }),
+      ]);
+    } finally {
+      clearTimeout(deadline);
+    }
+  };
   await assert.rejects(
     executeCommands(
       f.options({
         credentials,
         signal: controller.signal,
-        onLog: (value) => {
+        onLog: async (value) => {
           logs += value;
-          if (value === 'remote started\n')
-            controller.abort(new DOMException('Cancelled', 'AbortError'));
+          const ready = /^remote ready:(\d+):(\d+)\n$/.exec(value);
+          if (!ready) return;
+          childPid = Number(ready[1]);
+          afterCancellation = new Promise((resolve) => {
+            resolveAfterCancellation = resolve;
+          });
+          let confirmReady;
+          let rejectReady;
+          const confirmed = new Promise((resolve, reject) => {
+            confirmReady = resolve;
+            rejectReady = reject;
+          });
+          socket = net.createConnection({ host: '127.0.0.1', port: Number(ready[2]) });
+          socket.setEncoding('utf8');
+          let input = '';
+          socket.on('connect', () => socket.write(`ready ${handshake}\n`));
+          socket.on('data', (chunk) => {
+            input += chunk;
+            let end;
+            while ((end = input.indexOf('\n')) >= 0) {
+              const message = input.slice(0, end);
+              input = input.slice(end + 1);
+              if (message === `ready ${handshake}`) confirmReady();
+              if (message === `alive ${handshake}`) resolveAfterCancellation('alive');
+            }
+          });
+          socket.on('error', rejectReady);
+          socket.on('close', () => {
+            childClosed = true;
+            rejectReady(new Error('Remote child closed before the readiness handshake'));
+            resolveAfterCancellation('closed');
+          });
+          await bounded(confirmed, 'Remote child did not confirm readiness');
+          controller.abort(new DOMException('Cancelled', 'AbortError'));
         },
       }),
     ),
@@ -295,7 +359,13 @@ test('mock SSH cancellation sends a second connection to terminate the remote se
   assert.match(connections[1].input, /\/bin\/kill -TERM -- '-\d+'/);
   assert.match(connections[1].input, /\/bin\/kill -KILL -- '-\d+'/);
   assert.match(logs, /已经完成的文件修改不会自动撤销/);
-  await new Promise((resolve) => setTimeout(resolve, 1200));
+  assert.ok(childPid, 'the SIGTERM-ignoring child confirmed readiness before cancellation');
+  if (!socket.destroyed) socket.write(`probe ${handshake}\n`);
+  assert.equal(
+    await bounded(afterCancellation, 'Remote child remained connected after cancellation'),
+    'closed',
+    'cancellation must close the child-owned connection, rather than leave an orphan',
+  );
   await assert.rejects(fs.stat(sentinel), { code: 'ENOENT' });
 });
 

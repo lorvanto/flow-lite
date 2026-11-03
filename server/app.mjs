@@ -138,8 +138,18 @@ export async function createApp(config, options = {}) {
     return run;
   }
   function checkCredentials(project) {
-    for (const id of [project.buildCredentialId, project.deploy.credentialId].filter(Boolean))
-      if (!store.getCredential(id)) fail('所选 SSH 凭据不存在');
+    if (project.buildCredentialId) {
+      const credential = store.getCredential(project.buildCredentialId);
+      if (!credential) fail('所选仓库凭据不存在');
+      const https = /^https:\/\//i.test(project.repoUrl || '');
+      if (https && credential.type !== 'git-https') fail('HTTPS 仓库请选择 Git HTTPS 账号密码凭据');
+      if (!https && credential.type !== 'ssh') fail('Git HTTPS 账号密码凭据只能用于 HTTPS 仓库');
+    }
+    if (project.deploy.type === 'ssh') {
+      const credential = store.getCredential(project.deploy.credentialId);
+      if (!credential) fail('所选 SSH 凭据不存在');
+      if (credential.type !== 'ssh') fail('SSH 部署请选择 SSH 私钥或密码凭据');
+    }
   }
   function projectOutput(project) {
     return {
@@ -348,7 +358,7 @@ export async function createApp(config, options = {}) {
   const credentialOutput = (credential) => ({
     id: credential.id,
     name: credential.name,
-    type: 'ssh',
+    type: credential.type || 'ssh',
     authType: credential.authType || 'key',
     createdAt: credential.createdAt,
     hasKnownHosts: Boolean(credential.hasKnownHosts),

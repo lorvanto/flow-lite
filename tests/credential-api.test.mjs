@@ -204,3 +204,165 @@ test('root 用户可引用密码凭据，仓库和远程项目响应不包含认
   }
   assert.equal((await f.request('DELETE', `/api/credentials/${id}`)).code, 409);
 });
+
+test('Git HTTPS 账号密码完整加密存储，API 和任务响应不回显账号或密码', async (t) => {
+  const f = await fixture(t);
+  const username = 'fixture-git-account@example.invalid';
+  const password = '  fixture-token-"$&:/%中文  ';
+  const result = await f.request('POST', '/api/credentials', {
+    name: 'HTTPS 仓库',
+    type: 'git-https',
+    authType: 'password',
+    username,
+    password,
+    privateKey: fixtureKey,
+    knownHosts: 'must-not-be-stored',
+  });
+  assert.equal(result.code, 201);
+  const credential = result.body.credential;
+  metadataOnly(credential);
+  assert.equal(credential.type, 'git-https');
+  assert.equal(credential.authType, 'password');
+  assert.equal(credential.hasKnownHosts, false);
+  assert.equal(Object.hasOwn(credential, 'username'), false);
+  const stored = f.app.store.getCredential(credential.id);
+  assert.equal(stored.username, username);
+  assert.equal(stored.password, password);
+  assert.equal(stored.type, 'git-https');
+  assert.equal(Object.hasOwn(stored, 'privateKey'), false);
+  assert.equal(Object.hasOwn(stored, 'knownHosts'), false);
+  const raw = f.app.store.db
+    .prepare('SELECT secret FROM credentials WHERE id=?')
+    .get(credential.id).secret;
+  for (const secret of [username, password, 'fixture-token'])
+    assert.equal(raw.includes(secret), false);
+
+  const projectResult = await f.request('POST', '/api/projects', {
+    name: 'HTTPS 构建',
+    repoUrl: 'https://example.invalid/team/site.git',
+    buildCredentialId: credential.id,
+    deploy: { type: 'local', root: path.join(f.root, 'https-site') },
+  });
+  assert.equal(projectResult.code, 201);
+  assert.equal(projectResult.body.project.buildCredentialId, credential.id);
+  const run = await f.request('POST', `/api/projects/${projectResult.body.project.id}/runs`, {});
+  assert.equal(run.code, 202);
+  for (const body of [
+    result.body,
+    projectResult.body,
+    run.body,
+    (await f.request('GET', '/api/credentials')).body,
+    (await f.request('GET', '/api/projects')).body,
+  ]) {
+    assert.equal(JSON.stringify(body).includes(username), false);
+    assert.equal(JSON.stringify(body).includes(password), false);
+  }
+  assert.equal((await f.request('DELETE', `/api/credentials/${credential.id}`)).code, 409);
+
+  // Reopening the database uses the same encrypted record, without a schema migration.
+  const { createStore } = await import('../server/services/store.mjs');
+  const reopened = createStore(f.config);
+  try {
+    assert.equal(reopened.getCredential(credential.id).username, username);
+    assert.equal(reopened.getCredential(credential.id).password, password);
+    metadataOnly(reopened.listCredentials()[0]);
+  } finally {
+    reopened.close();
+  }
+});
+
+test('Git HTTPS 凭据校验账号与密码，拒绝协议不匹配的仓库和 SSH 部署', async (t) => {
+  const f = await fixture(t);
+  const base = {
+    name: 'Git HTTPS',
+    type: 'git-https',
+    username: 'fixture-user',
+    password: 'fixture-token',
+  };
+  for (const patch of [
+    { username: undefined },
+    { username: '' },
+    { username: '   ' },
+    { username: 'bad:name' },
+    { username: 'bad\nname' },
+    { username: 'bad\tname' },
+    { username: 'u'.repeat(256) },
+    { password: undefined },
+    { password: '' },
+    { password: 'p'.repeat(4097) },
+    { password: 'bad\0secret' },
+    { password: 'bad\rsecret' },
+    { password: 'bad\nsecret' },
+    { authType: 'key' },
+    { type: 'http' },
+  ]) {
+    assert.equal((await f.request('POST', '/api/credentials', { ...base, ...patch })).code, 400);
+  }
+  const httpsCredential = (await f.request('POST', '/api/credentials', base)).body.credential;
+  const sshCredential = (
+    await f.request('POST', '/api/credentials', {
+      name: 'SSH',
+      type: 'ssh',
+      authType: 'password',
+      password: 'ssh-fixture-only',
+    })
+  ).body.credential;
+  const project = {
+    name: '协议校验',
+    repoUrl: 'https://example.invalid/team/site.git',
+    deploy: { type: 'local', root: path.join(f.root, 'site') },
+  };
+  const mismatch = await f.request('POST', '/api/projects', {
+    ...project,
+    buildCredentialId: sshCredential.id,
+  });
+  assert.equal(mismatch.code, 400);
+  assert.match(mismatch.body.error, /HTTPS.*凭据/);
+  assert.equal(
+    (
+      await f.request('POST', '/api/projects', {
+        ...project,
+        repoUrl: 'git@example.invalid:team/site.git',
+        buildCredentialId: httpsCredential.id,
+      })
+    ).code,
+    400,
+  );
+  assert.equal(
+    (
+      await f.request('POST', '/api/projects', {
+        ...project,
+        deploy: {
+          type: 'ssh',
+          host: 'example.invalid',
+          user: 'root',
+          port: 22,
+          root: '/srv/www/site',
+          credentialId: httpsCredential.id,
+        },
+      })
+    ).code,
+    400,
+  );
+  for (const repoUrl of [
+    'http://example.invalid/site.git',
+    'https://user:password@example.invalid/site.git',
+  ]) {
+    assert.equal((await f.request('POST', '/api/projects', { ...project, repoUrl })).code, 400);
+  }
+  assert.equal((await f.request('POST', '/api/projects', { ...project })).code, 201);
+  const valid = await f.request('POST', '/api/projects', {
+    ...project,
+    buildCredentialId: httpsCredential.id,
+  });
+  assert.equal(valid.code, 201);
+  assert.equal(
+    (
+      await f.request('PUT', `/api/projects/${valid.body.project.id}`, {
+        ...project,
+        buildCredentialId: sshCredential.id,
+      })
+    ).code,
+    400,
+  );
+});

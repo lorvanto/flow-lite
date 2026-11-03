@@ -64,14 +64,15 @@ export function validateProject(input, config) {
   const repoUrl = string(input.repoUrl, 'Git 仓库地址', 2000);
   if (!repoUrl || /[\r\n\s]/.test(repoUrl) || repoUrl.startsWith('-'))
     fail('Git 仓库地址格式不正确');
-  if (repoUrl.startsWith('https://')) {
+  if (/^https:\/\//i.test(repoUrl)) {
     let url;
     try {
       url = new URL(repoUrl);
     } catch {
       fail('Git 仓库地址格式不正确');
     }
-    if (url.username || url.password) fail('请使用 SSH 凭据连接私有仓库，不要在 URL 中保存密码');
+    if (url.username || url.password)
+      fail('请在凭据管理中保存仓库账号密码，不要在 URL 中填写账号、密码或令牌');
     if (!url.hostname) fail('Git 仓库地址缺少主机');
   } else if (/^ssh:\/\//.test(repoUrl)) {
     let url;
@@ -224,9 +225,27 @@ function validateEnvironment(input, type) {
 }
 
 export function validateCredential(input) {
-  if (!input || typeof input !== 'object' || Array.isArray(input)) fail('请提交 SSH 凭据');
+  if (!input || typeof input !== 'object' || Array.isArray(input)) fail('请提交凭据');
   const name = string(input.name, '凭据名称', 100);
-  if (!name || (input.type && input.type !== 'ssh')) fail('请填写 SSH 凭据名称');
+  if (!name) fail('请填写凭据名称');
+  const type = input.type ?? 'ssh';
+  if (!['ssh', 'git-https'].includes(type)) fail('凭据类型必须为 SSH 或 Git HTTPS');
+  if (type === 'git-https') {
+    if (input.authType !== undefined && input.authType !== 'password')
+      fail('Git HTTPS 认证方式必须为账号密码');
+    const username = string(input.username, '仓库账号', 255);
+    if (!username || /[\x00-\x1f\x7f-\x9f:]/.test(username))
+      fail('仓库账号不能为空，且不能包含冒号或控制字符');
+    const password = input.password;
+    if (
+      typeof password !== 'string' ||
+      !password.length ||
+      password.length > 4096 ||
+      /[\0\r\n]/.test(password)
+    )
+      fail('仓库密码或访问令牌不能为空，最多 4096 位且不能包含空字符或换行');
+    return { name, type, authType: 'password', username, password };
+  }
   const authType = input.authType ?? 'key';
   if (!['key', 'password'].includes(authType)) fail('SSH 认证方式必须为私钥或密码');
   const knownHosts = string(input.knownHosts, '主机公钥', 50000, '');

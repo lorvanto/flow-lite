@@ -1,5 +1,5 @@
 <script setup>
-import { ref, watch } from 'vue';
+import { computed, ref, watch } from 'vue';
 import {
   Box,
   CheckCircle2,
@@ -12,6 +12,7 @@ import {
   XCircle,
 } from '@lucide/vue';
 import { credentialLabel } from '../lib/format.js';
+import { matchesRepository } from '../lib/credentials.js';
 
 const form = defineModel({ type: Object, required: true });
 const props = defineProps({
@@ -23,6 +24,38 @@ const props = defineProps({
   formError: { type: String, default: '' },
 });
 defineEmits(['submit', 'cancel']);
+
+const repositoryCredentials = computed(() =>
+  props.credentials.filter((credential) => matchesRepository(credential, form.value.repoUrl)),
+);
+const sshCredentials = computed(() =>
+  props.credentials.filter((credential) => !credential.type || credential.type === 'ssh'),
+);
+
+watch(
+  [() => form.value.repoUrl, () => props.credentials],
+  () => {
+    if (!form.value.buildCredentialId) return;
+    const selected = props.credentials.find(
+      (credential) => credential.id === form.value.buildCredentialId,
+    );
+    if (!selected || !matchesRepository(selected, form.value.repoUrl))
+      form.value.buildCredentialId = null;
+  },
+  { immediate: true },
+);
+
+watch(
+  [() => form.value.deploy.credentialId, () => props.credentials],
+  () => {
+    if (!form.value.deploy.credentialId) return;
+    if (
+      !sshCredentials.value.some((credential) => credential.id === form.value.deploy.credentialId)
+    )
+      form.value.deploy.credentialId = null;
+  },
+  { immediate: true },
+);
 
 const nodeChoice = ref('24');
 // Only reset when a different form is opened, not while a custom version is typed.
@@ -138,7 +171,7 @@ function changeManager() {
               required
               placeholder="git@github.com:team/project.git 或 HTTPS 地址"
             />
-            <small>私有仓库推荐使用 SSH 地址，并选择对应凭据。</small>
+            <small>HTTPS 或 SSH 地址可选择对应仓库凭据，请勿在地址中填写密码或令牌。</small>
           </label>
           <label class="field">
             <span>
@@ -148,10 +181,14 @@ function changeManager() {
             <input v-model="form.branch" required placeholder="main" />
           </label>
           <label class="field">
-            仓库 SSH 凭据
-            <select v-model="form.buildCredentialId">
+            仓库凭据
+            <select v-model="form.buildCredentialId" aria-label="仓库凭据">
               <option :value="null">无需凭据 / 使用服务器现有配置</option>
-              <option v-for="credential in credentials" :key="credential.id" :value="credential.id">
+              <option
+                v-for="credential in repositoryCredentials"
+                :key="credential.id"
+                :value="credential.id"
+              >
                 {{ credentialLabel(credential) }}
               </option>
             </select>
@@ -348,10 +385,10 @@ function changeManager() {
             </label>
             <label class="field">
               部署 SSH 凭据
-              <select v-model="form.deploy.credentialId" required>
+              <select v-model="form.deploy.credentialId" required aria-label="部署 SSH 凭据">
                 <option :value="null" disabled>请选择 SSH 部署凭据</option>
                 <option
-                  v-for="credential in credentials"
+                  v-for="credential in sshCredentials"
                   :key="credential.id"
                   :value="credential.id"
                 >

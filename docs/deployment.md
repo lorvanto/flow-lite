@@ -6,6 +6,8 @@
 
 平台需要 Linux 和 Node.js 24+。Node.js Docker 构建需要 Git、Docker 和 `tar`；SSH 功能需要 OpenSSH 客户端。仅执行 PHP / 自定义命令时无需 Docker，所需工具由执行目标提供。
 
+使用 Git HTTPS 账号密码凭据时，平台执行机的 Git 须为 **2.32+**，先以运行账号执行 `git --version` 确认；这不是 SSH 或公开 HTTPS 仓库的新增版本限制。
+
 创建独立非 root 运行账号与目录，例如：
 
 ```sh

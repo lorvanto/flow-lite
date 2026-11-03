@@ -6,6 +6,7 @@ import { fileURLToPath } from 'node:url';
 import { runProcess, checkAbort } from '../lib/process.mjs';
 import { validateNodeImagePrefix } from '../config.mjs';
 import { prepareSshAuth } from './ssh-auth.mjs';
+import { prepareGitHttpsAuth } from './git-auth.mjs';
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const VERSION = /^(?:v)?(\d{1,2})(?:\.(\d{1,3}))?(?:\.(\d{1,3}))?$/;
@@ -97,7 +98,7 @@ function assertRepository(repoUrl, config) {
   if (/^https:\/\//i.test(repoUrl)) {
     const url = new URL(repoUrl);
     if (url.username || url.password)
-      throw new Error('请使用 SSH 仓库和凭据，不要在 Git 地址中填写密码或令牌');
+      throw new Error('请通过凭据配置账号、密码或令牌，不要写入 Git 仓库地址');
     return;
   }
   if (/^ssh:\/\//i.test(repoUrl)) {
@@ -124,11 +125,24 @@ function assertRepository(repoUrl, config) {
   throw new Error('仓库仅支持 HTTPS 或 SSH 地址；本地仓库仅在显式开启测试选项时可用');
 }
 
-function getCredential(credentials, id) {
+function lookupCredential(credentials, id) {
   if (!id) return null;
   const credential = credentials instanceof Map ? credentials.get(id) : credentials?.[id];
-  if (!credential || credential.type !== 'ssh') throw new Error('所选 SSH 凭据不存在');
+  if (!credential) throw new Error('所选凭据不存在');
+  return { ...credential, type: credential.type || 'ssh' };
+}
+
+function getCredential(credentials, id) {
+  const credential = lookupCredential(credentials, id);
+  if (credential && credential.type !== 'ssh') throw new Error('发布目标仅支持 SSH 凭据');
   return credential;
+}
+
+async function requireGitHttpsIsolation(env, signal) {
+  const version = await runProcess('git', ['--version'], { env, signal });
+  const match = /^git version (\d+)\.(\d+)/.exec(version.stdout.trim());
+  if (!match || Number(match[1]) < 2 || (Number(match[1]) === 2 && Number(match[2]) < 32))
+    throw new Error('Git HTTPS 凭据需要 Git 2.32 或以上，请升级 Git 后重试');
 }
 
 async function realDirectoryWithin(root, relative, label) {
@@ -650,6 +664,7 @@ export async function executeBuild(options) {
   const sourceDir = path.join(tempDir, 'source');
   let artifactPath;
   let archived = false;
+  let httpsAuth;
   try {
     assertRepository(project.repoUrl, config);
     const branch = project.branch || 'main';
@@ -674,21 +689,39 @@ export async function executeBuild(options) {
     const environment = projectEnvironment(project.environment);
     await onStage('checkout');
     await onLog(`检出仓库分支：${branch}\n`);
-    const credential = getCredential(credentials, project.buildCredentialId);
-    const auth = await prepareSshAuth({
-      credential,
-      tempDir,
-      prefix: 'repository',
-      env: baseEnvironment(),
-    });
-    const gitEnv = {
-      ...auth.env,
+    const credential = lookupCredential(credentials, project.buildCredentialId);
+    const gitBase = {
+      ...baseEnvironment(),
       GIT_TERMINAL_PROMPT: '0',
       GIT_CONFIG_GLOBAL: '/dev/null',
       GIT_CONFIG_NOSYSTEM: '1',
-      GIT_SSH_COMMAND: ['ssh', ...auth.args].map(shellQuote).join(' '),
       GIT_ALLOW_PROTOCOL: config.allowLocalRepositories ? 'https:ssh:file' : 'https:ssh',
     };
+    let gitEnv;
+    if (/^https:\/\//i.test(project.repoUrl)) {
+      if (credential && credential.type !== 'git-https')
+        throw new Error('HTTPS 仓库需要 Git HTTPS 账号密码或令牌凭据');
+      if (credential) {
+        await requireGitHttpsIsolation(gitBase, signal);
+        httpsAuth = await prepareGitHttpsAuth({
+          credential,
+          repoUrl: project.repoUrl,
+          tempDir,
+          env: gitBase,
+        });
+        gitEnv = httpsAuth.env;
+      } else gitEnv = gitBase;
+    } else {
+      if (credential && credential.type !== 'ssh')
+        throw new Error('SSH 或本地仓库不能使用 Git HTTPS 凭据');
+      const auth = await prepareSshAuth({
+        credential,
+        tempDir,
+        prefix: 'repository',
+        env: gitBase,
+      });
+      gitEnv = { ...auth.env, GIT_SSH_COMMAND: ['ssh', ...auth.args].map(shellQuote).join(' ') };
+    }
     await runProcess(
       'git',
       [
@@ -711,7 +744,7 @@ export async function executeBuild(options) {
       try {
         await runProcess('git', ['cat-file', '-e', `${run.commitSha}^{commit}`], {
           cwd: sourceDir,
-          env: gitEnv,
+          env: httpsAuth ? gitBase : gitEnv,
           signal,
         });
       } catch (error) {
@@ -724,17 +757,21 @@ export async function executeBuild(options) {
         });
       }
     }
+    // Network credentials must be gone before Git checkout can invoke filters or
+    // any repository package/build code starts executing.
+    if (httpsAuth) await httpsAuth.cleanup();
+    const checkoutEnv = httpsAuth ? gitBase : gitEnv;
     const commitSha = (
       await runProcess('git', ['rev-parse', run.commitSha || 'HEAD'], {
         cwd: sourceDir,
-        env: gitEnv,
+        env: checkoutEnv,
         signal,
       })
     ).stdout.trim();
     if (!/^[0-9a-f]{40,64}$/.test(commitSha)) throw new Error('无法识别 Git 提交版本');
     await runProcess('git', ['checkout', '--detach', commitSha], {
       cwd: sourceDir,
-      env: gitEnv,
+      env: checkoutEnv,
       signal,
       onOutput: onLog,
     });
@@ -778,6 +815,7 @@ export async function executeBuild(options) {
       await fs.rm(artifactPath, { recursive: true, force: true }).catch(() => {});
     throw error;
   } finally {
+    if (httpsAuth) await httpsAuth.cleanup().catch(() => {});
     await fs.rm(tempDir, { recursive: true, force: true }).catch(() => {});
   }
 }

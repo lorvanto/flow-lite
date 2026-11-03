@@ -12,14 +12,18 @@
 - Node.js 项目：拉取 Git 代码、安装依赖、构建和保存静态产物；支持 Node.js 14、18、22、24、26、自定义版本和仓库版本文件识别。
 - 本机或 SSH 发布：独立版本目录、原子切换，以及使用历史产物回滚。
 - PHP / 命令发布：在已有项目目录中执行多行 Shell 命令，适合 Git 更新、Composer 安装和缓存清理。
-- SSH 私钥或密码认证，支持为代码仓库和部署目标分别选择凭据。
+- Git 仓库支持 SSH 私钥 / 密码和 HTTPS 账号 + 密码 / 访问令牌，仓库凭据与 SSH 部署凭据分别配置。
 - 项目分组、串行任务队列、实时日志、运行历史、取消和重新运行。
+
+GitHub 的 HTTPS Git 操作需要访问令牌，不接受 GitHub 账户密码；支持密码的 Git 服务器可使用原密码。配置步骤见[仓库凭据说明](docs/usage.md#仓库与部署凭据)和 [GitHub 官方认证说明](https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/about-authentication-to-github#https)。
 
 平台面向可信管理员和自有仓库。自定义命令会直接修改目标目录，取消和重试不会撤销已完成的操作；仅 Node.js 静态产物支持版本回滚。当前没有 Webhook、拖拽编排、多用户权限或 Node.js 常驻服务托管。
 
 ## 快速启动
 
 平台需要 **Node.js 24+**。Node.js 容器构建另需 Git、Docker 和 `tar`；SSH 功能需要 OpenSSH 客户端。只执行 PHP / 自定义命令时不需要 Docker，PHP、Composer 等由执行目标提供。
+
+Git HTTPS 账号密码认证需要执行机安装 **Git 2.32+**；SSH 和不使用凭据的公开 HTTPS 仓库不受这项新增版本要求影响。
 
 ```sh
 git clone https://github.com/lorvanto/flow-lite.git

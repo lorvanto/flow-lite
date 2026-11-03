@@ -16,4 +16,16 @@ Flow Lite 面向可信管理员管理自己的项目。平台允许执行仓库�
 - SSH 主机公钥必须核实；静态发布目录与平台私有数据目录应分开。
 - `.env`、数据库、`master.key` 和备份需限制读取权限。凭据及配置的环境变量加密保存，日志对已配置的秘密值进行脱敏；脚本本身的外部输出及操作仍由管理员负责。
 
+## HTTPS Git 凭据
+
+HTTPS 仓库的账号与密码 / 访问令牌加密保存在凭据中，API 不回显这些字段。使用独立的仓库凭据，不把账号、密码或令牌写入克隆 URL；SSH 部署继续使用 SSH 凭据。
+
+该认证模式要求 Git 2.32+，不兼容的旧版本会明确拒绝执行，不降级绕过检出进程配置和认证隔离。SSH 与不使用凭据的公开 HTTPS 仓库不受该新增版本限制影响。
+
+认证仅作用于检出阶段的 Git 进程：通过 `0600` 临时文件和专用 credential helper 提供凭据，重置其他 helper，并按 HTTPS 主机、端口及仓库路径限制匹配范围。helper 不保存持久化凭据；clone / fetch 完成后、checkout 与构建前清理临时认证目录，异常时同样清理。构建容器、包管理器和原地命令不会继承此仓库认证。helper 的路径匹配与重置语义见 [Git 官方凭据文档](https://git-scm.com/docs/gitcredentials)。
+
+TLS 证书校验保持开启，认证检出不自动跟随 HTTP 重定向。私有 Git 服务的证书需被执行机信任；地址迁移时改用最终的 HTTPS 克隆地址。
+
+GitHub 的 HTTPS Git 操作不支持账户密码，应使用拥有目标仓库权限的访问令牌；其他 Git 服务器是否接受原密码由其认证策略决定。[GitHub 官方说明](https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/about-authentication-to-github#https)。
+
 部署与备份操作见 [部署说明](docs/deployment.md) 和 [运维说明](docs/operations.md)。

@@ -1,5 +1,5 @@
 <script setup>
-import { computed, onMounted, onUnmounted, ref } from 'vue';
+import { computed, onMounted, onUnmounted, ref, watch } from 'vue';
 import {
   Activity,
   ArrowLeft,
@@ -32,7 +32,8 @@ import {
   XCircle,
 } from '@lucide/vue';
 import { request } from './lib/api.js';
-import { credentialLabel, date, duration, executionDirectory, repoName } from './lib/format.js';
+import { date, duration, executionDirectory, repoName } from './lib/format.js';
+import { createCredentialForm, credentialPayload, credentialTypeLabel } from './lib/credentials.js';
 import { isCommand, runLabel, stageLabels } from './lib/pipeline.js';
 import { useRunLogs } from './composables/useRunLogs.js';
 import BaseModal from './components/BaseModal.vue';
@@ -65,13 +66,15 @@ const modal = ref(null);
 const editingId = ref(null);
 const formError = ref('');
 const form = ref({});
-const credentialForm = ref({
-  name: '',
-  authType: 'key',
-  privateKey: '',
-  password: '',
-  knownHosts: '',
-});
+const credentialForm = ref(createCredentialForm());
+watch(
+  modal,
+  (current, previous) => {
+    if (previous === 'credential' && current !== 'credential')
+      credentialForm.value = createCredentialForm();
+  },
+  { flush: 'sync' },
+);
 const passwordForm = ref({ currentPassword: '', newPassword: '', confirmPassword: '' });
 const passwordError = ref('');
 const confirmation = ref(null);
@@ -425,13 +428,7 @@ async function copyLog() {
   }
 }
 function addCredential() {
-  credentialForm.value = {
-    name: '',
-    authType: 'key',
-    privateKey: '',
-    password: '',
-    knownHosts: '',
-  };
+  credentialForm.value = createCredentialForm();
   formError.value = '';
   modal.value = 'credential';
 }
@@ -439,26 +436,13 @@ async function saveCredential() {
   busy.value = 'save-credential';
   formError.value = '';
   try {
-    const { name, authType, knownHosts, privateKey, password } = credentialForm.value;
     await request('/credentials', {
       method: 'POST',
-      body: {
-        name,
-        type: 'ssh',
-        authType,
-        knownHosts,
-        ...(authType === 'password' ? { password } : { privateKey }),
-      },
+      body: credentialPayload(credentialForm.value),
     });
-    credentialForm.value = {
-      name: '',
-      authType: 'key',
-      privateKey: '',
-      password: '',
-      knownHosts: '',
-    };
+    credentialForm.value = createCredentialForm();
     modal.value = null;
-    notify('SSH 凭据已保存');
+    notify('凭据已保存');
     await refresh();
   } catch (error) {
     formError.value = error.message;
@@ -1413,7 +1397,7 @@ onUnmounted(() => {
             <div>
               <div class="page-eyebrow">CREDENTIALS</div>
               <h1>凭据管理</h1>
-              <p>集中管理连接代码仓库与部署服务器的 SSH 私钥或密码。</p>
+              <p>集中管理 SSH 私钥、SSH 密码与 Git HTTPS 仓库账号密码。</p>
             </div>
             <button class="button primary" @click="addCredential">
               <Plus :size="17" />
@@ -1424,13 +1408,13 @@ onUnmounted(() => {
             <ShieldCheck :size="20" />
             <div>
               <strong>凭据加密保存，按项目使用</strong>
-              <p>保存后的私钥和密码不会再次展示。为每个项目选择所需的登录凭据。</p>
+              <p>账号、密码和私钥加密保存，保存后不会回显。为仓库和部署服务器选择对应凭据。</p>
             </div>
           </div>
           <section class="panel">
             <div class="panel-toolbar">
               <h2>
-                SSH 凭据
+                连接凭据
                 <span class="heading-count">{{ credentials.length }}</span>
               </h2>
             </div>
@@ -1440,11 +1424,11 @@ onUnmounted(() => {
               <p>
                 访问私有仓库或通过 SSH 发布时，
                 <br />
-                添加 SSH 私钥或密码凭据即可连接。
+                添加对应的仓库或 SSH 连接凭据。
               </p>
               <button class="button secondary" @click="addCredential">
                 <Plus :size="16" />
-                添加 SSH 凭据
+                添加连接凭据
               </button>
             </div>
             <div v-else class="table-scroll">
@@ -1453,7 +1437,7 @@ onUnmounted(() => {
                   <tr>
                     <th>凭据名称</th>
                     <th>类型</th>
-                    <th>主机校验</th>
+                    <th>连接校验</th>
                     <th>创建时间</th>
                     <th class="right">操作</th>
                   </tr>
@@ -1468,12 +1452,18 @@ onUnmounted(() => {
                     </td>
                     <td>
                       <span class="neutral-badge">
-                        {{ credential.authType === 'password' ? 'SSH 密码' : 'SSH 私钥' }}
+                        {{ credentialTypeLabel(credential) }}
                       </span>
                     </td>
                     <td>
                       <span class="subtle-text">
-                        {{ credential.hasKnownHosts ? '已配置可信主机' : '使用服务器 known_hosts' }}
+                        {{
+                          credential.type === 'git-https'
+                            ? 'HTTPS 证书校验'
+                            : credential.hasKnownHosts
+                              ? '已配置可信主机'
+                              : '使用服务器 known_hosts'
+                        }}
                       </span>
                     </td>
                     <td class="subtle-text">{{ date(credential.createdAt, true) }}</td>
@@ -1649,7 +1639,7 @@ onUnmounted(() => {
 
   <BaseModal
     :open="Boolean(modal)"
-    :title="modal === 'project' ? (editingId ? '编辑流水线' : '新建流水线') : '添加 SSH 凭据'"
+    :title="modal === 'project' ? (editingId ? '编辑流水线' : '新建流水线') : '添加连接凭据'"
     :label="modal === 'project' ? '流水线配置' : '添加凭据'"
     :icon="modal === 'project' ? Workflow : KeyRound"
     :variant="modal || 'project'"

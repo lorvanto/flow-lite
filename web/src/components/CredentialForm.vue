@@ -1,5 +1,7 @@
 <script setup>
+import { computed } from 'vue';
 import { Loader2, ShieldCheck, XCircle } from '@lucide/vue';
+import { changeCredentialKind, credentialKind } from '../lib/credentials.js';
 
 const credentialForm = defineModel({ type: Object, required: true });
 defineProps({
@@ -8,10 +10,10 @@ defineProps({
 });
 defineEmits(['submit', 'cancel']);
 
-function changeCredentialAuth() {
-  credentialForm.value.privateKey = '';
-  credentialForm.value.password = '';
-}
+const kind = computed({
+  get: () => credentialKind(credentialForm.value),
+  set: (value) => changeCredentialKind(credentialForm.value, value),
+});
 </script>
 
 <template>
@@ -30,17 +32,33 @@ function changeCredentialAuth() {
           v-model="credentialForm.name"
           required
           maxlength="100"
-          placeholder="例如：生产服务器登录凭据"
+          :placeholder="
+            credentialForm.type === 'git-https'
+              ? '例如：代码仓库访问凭据'
+              : '例如：生产服务器登录凭据'
+          "
         />
       </label>
       <label class="field">
         认证方式
-        <select v-model="credentialForm.authType" @change="changeCredentialAuth">
-          <option value="key">SSH 私钥</option>
-          <option value="password">SSH 密码</option>
+        <select v-model="kind">
+          <option value="ssh-key">SSH 私钥</option>
+          <option value="ssh-password">SSH 密码</option>
+          <option value="git-https">Git HTTPS 账号密码</option>
         </select>
       </label>
-      <label v-if="credentialForm.authType === 'key'" class="field">
+      <label v-if="credentialForm.type === 'git-https'" class="field">
+        <span>仓库账号 <b>*</b></span>
+        <input
+          v-model.trim="credentialForm.username"
+          required
+          maxlength="255"
+          autocomplete="off"
+          placeholder="输入 Git 仓库登录账号"
+        />
+        <small>账号与密码会加密保存，保存后不会再次展示。</small>
+      </label>
+      <label v-if="kind === 'ssh-key'" class="field">
         <span>
           SSH 私钥
           <b>*</b>
@@ -58,7 +76,7 @@ function changeCredentialAuth() {
       </label>
       <label v-else class="field">
         <span>
-          SSH 密码
+          {{ credentialForm.type === 'git-https' ? '仓库密码 / 访问令牌' : 'SSH 密码' }}
           <b>*</b>
         </span>
         <input
@@ -66,12 +84,17 @@ function changeCredentialAuth() {
           type="password"
           autocomplete="new-password"
           required
-          maxlength="1024"
-          placeholder="输入 SSH 登录密码"
+          :maxlength="credentialForm.type === 'git-https' ? 4096 : 1024"
+          :placeholder="
+            credentialForm.type === 'git-https' ? '输入密码或访问令牌' : '输入 SSH 登录密码'
+          "
         />
-        <small>密码会加密保存，保存后不会再次展示。</small>
+        <small v-if="credentialForm.type === 'git-https'"
+          >GitHub 等平台需要使用访问令牌代替账号密码，请按仓库要求填写。</small
+        >
+        <small v-else>密码会加密保存，保存后不会再次展示。</small>
       </label>
-      <label class="field">
+      <label v-if="credentialForm.type !== 'git-https'" class="field">
         可信主机（known_hosts）
         <textarea
           v-model="credentialForm.knownHosts"

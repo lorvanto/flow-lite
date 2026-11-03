@@ -259,13 +259,14 @@ export function createStore(config) {
             db.prepare('SELECT secret FROM credentials WHERE id=?').get(row.id).secret,
             config.masterKey,
           );
+          const type = secret.type || 'ssh';
           return {
             id: row.id,
             name: row.name,
-            type: 'ssh',
-            authType: secret.authType || 'key',
+            type,
+            authType: secret.authType || (type === 'git-https' ? 'password' : 'key'),
             createdAt: row.created_at,
-            hasKnownHosts: Boolean(secret.knownHosts),
+            hasKnownHosts: type === 'ssh' && Boolean(secret.knownHosts),
           };
         });
     },
@@ -276,22 +277,27 @@ export function createStore(config) {
       return {
         id: row.id,
         name: row.name,
-        type: 'ssh',
         ...secret,
-        authType: secret.authType || 'key',
+        type: secret.type || 'ssh',
+        authType: secret.authType || (secret.type === 'git-https' ? 'password' : 'key'),
         createdAt: row.created_at,
       };
     },
     saveCredential(model) {
       const id = randomUUID();
-      const authType = model.authType || 'key';
-      const secret = {
-        authType,
-        knownHosts: model.knownHosts || '',
-        ...(authType === 'password'
-          ? { password: model.password }
-          : { privateKey: model.privateKey }),
-      };
+      const type = model.type || 'ssh';
+      const authType = model.authType || (type === 'git-https' ? 'password' : 'key');
+      const secret =
+        type === 'git-https'
+          ? { type, authType, username: model.username, password: model.password }
+          : {
+              type,
+              authType,
+              knownHosts: model.knownHosts || '',
+              ...(authType === 'password'
+                ? { password: model.password }
+                : { privateKey: model.privateKey }),
+            };
       db.prepare('INSERT INTO credentials(id,name,secret,created_at) VALUES(?,?,?,?)').run(
         id,
         model.name,

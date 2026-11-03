@@ -15,6 +15,13 @@ export function secretValues(project, credentials) {
       .map((item) => item.password)
       .filter((value) => typeof value === 'string' && value.length > 0),
   );
+  for (const item of items) {
+    if (item.type !== 'git-https' || typeof item.password !== 'string' || !item.password) continue;
+    values.push(encodeURIComponent(item.password.toWellFormed()));
+    if (typeof item.username === 'string') {
+      values.push(Buffer.from(`${item.username}:${item.password}`, 'utf8').toString('base64'));
+    }
+  }
   return [...new Set(values)].sort((a, b) => b.length - a.length);
 }
 export function redactText(text, secrets) {

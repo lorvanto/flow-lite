@@ -14,6 +14,7 @@ import {
   installPackageManager,
 } from '../server/runners/build.mjs';
 import { runProcess } from '../server/lib/process.mjs';
+import { createGitHttpsFixture } from './helpers/git-https.mjs';
 
 test('Node image selection keeps version tags while allowing alternate registries', () => {
   assert.equal(nodeImageName('14'), 'node:14-bullseye');
@@ -500,4 +501,148 @@ if(repository){const child=cp.spawn('git',['upload-pack',${JSON.stringify(f.repo
     await assert.rejects(fs.stat(captured.passwordFile), { code: 'ENOENT' });
     await assert.rejects(fs.stat(captured.env.SSH_ASKPASS), { code: 'ENOENT' });
   }
+});
+
+test('real HTTPS Git retry fetches its fixed commit and removes credentials before checkout/build', async (t) => {
+  const f = await fixture(t);
+  await fs.writeFile(path.join(f.repo, 'page.txt'), '<h1>version two</h1>');
+  await f.git(['add', '.']);
+  await f.git(['commit', '-m', 'advance main']);
+  const remote = await createGitHttpsFixture(t, { repoDir: f.repo });
+  const calls = await remote.installGitCaShim();
+  const credentialId = randomUUID();
+  const credentials = {
+    [credentialId]: {
+      type: 'git-https',
+      authType: 'password',
+      username: remote.username,
+      password: remote.password,
+    },
+  };
+  f.project.repoUrl = remote.url;
+  f.project.buildCredentialId = credentialId;
+  f.project.buildCommand +=
+    " && node -e \"if(process.env.FLOW_GIT_CREDENTIAL_FILE||process.env.GIT_CONFIG_COUNT||require('node:fs').readdirSync('..').some(n=>n.startsWith('git-https-')))process.exit(52)\"";
+  let inspected = false;
+  const result = await executeBuild(
+    f.options(f.run({ commitSha: f.commit }), {
+      credentials,
+      onMetadata: async (value) => {
+        if (!value.commitSha) return;
+        const workspaces = path.join(f.config.dataDir, 'workspaces');
+        const directories = await fs.readdir(workspaces);
+        const directory = path.join(workspaces, directories[0]);
+        assert.equal(
+          (await fs.readdir(directory)).some((name) => name.startsWith('git-https-')),
+          false,
+        );
+        const config = await fs.readFile(path.join(directory, 'source/.git/config'), 'utf8');
+        assert.ok(config.includes(remote.url));
+        assert.equal(config.includes(remote.password), false);
+        assert.equal(config.includes('helper.cjs'), false);
+        assert.equal(config.includes('credential'), false);
+        inspected = true;
+      },
+    }),
+  );
+  assert.equal(inspected, true);
+  assert.equal(result.commitSha, f.commit);
+  assert.equal(
+    await fs.readFile(path.join(result.artifactPath, 'index.html'), 'utf8'),
+    '<h1>version one</h1>',
+  );
+  assert.ok((await fs.readFile(calls, 'utf8')).split('\n').includes('fetch'));
+  assert.deepEqual(await fs.readdir(path.join(f.config.dataDir, 'workspaces')), []);
+});
+
+test('wrong HTTPS password fails a real clone and cleans all task-local authentication files', async (t) => {
+  const f = await fixture(t);
+  const remote = await createGitHttpsFixture(t, { repoDir: f.repo });
+  await remote.installGitCaShim();
+  const credentialId = randomUUID();
+  const credentials = {
+    [credentialId]: {
+      type: 'git-https',
+      authType: 'password',
+      username: remote.username,
+      password: 'definitely-wrong-password',
+    },
+  };
+  f.project.repoUrl = remote.url;
+  f.project.buildCredentialId = credentialId;
+  await assert.rejects(executeBuild(f.options(f.run(), { credentials })));
+  assert.deepEqual(await fs.readdir(path.join(f.config.dataDir, 'workspaces')), []);
+  assert.equal(
+    remote.requests.some((request) => request.authenticated),
+    false,
+  );
+});
+
+test('runner independently rejects HTTPS/SSH credential mismatches and HTTPS credentials for deployment', async (t) => {
+  const f = await fixture(t);
+  const credentialId = randomUUID();
+  f.project.buildCredentialId = credentialId;
+  f.project.repoUrl = 'https://example.invalid/team/repo.git';
+  await assert.rejects(
+    executeBuild(
+      f.options(f.run(), {
+        credentials: { [credentialId]: { type: 'ssh', privateKey: 'fixture' } },
+      }),
+    ),
+    /HTTPS 仓库需要/,
+  );
+  const credentials = {
+    [credentialId]: {
+      type: 'git-https',
+      authType: 'password',
+      username: 'fixture-user',
+      password: 'fixture-token',
+    },
+  };
+  f.project.repoUrl = 'ssh://root@example.invalid/team/repo.git';
+  await assert.rejects(executeBuild(f.options(f.run(), { credentials })), /不能使用 Git HTTPS/);
+  f.project.repoUrl = f.repo;
+  f.project.buildCredentialId = null;
+  f.project.deploy = {
+    type: 'ssh',
+    host: 'example.invalid',
+    user: 'root',
+    root: '/srv/www/fixture',
+    credentialId,
+  };
+  await assert.rejects(executeBuild(f.options(f.run(), { credentials })), /发布目标仅支持 SSH/);
+});
+
+test('HTTPS credentials fail closed on Git older than 2.32 before a helper is created', async (t) => {
+  const f = await fixture(t);
+  const bin = path.join(f.root, 'old-git-bin');
+  await fs.mkdir(bin);
+  const marker = path.join(f.root, 'version-check.json');
+  await fs.writeFile(
+    path.join(bin, 'git'),
+    `#!/usr/bin/env node\nconst fs=require('node:fs');const path=require('node:path');const root=${JSON.stringify(path.join(f.config.dataDir, 'workspaces'))};const run=fs.readdirSync(root)[0];fs.writeFileSync(${JSON.stringify(marker)},JSON.stringify({args:process.argv.slice(2),helperPresent:fs.readdirSync(path.join(root,run)).some(x=>x.startsWith('git-https-'))}));console.log('git version 2.31.9');\n`,
+    { mode: 0o755 },
+  );
+  const previous = process.env.PATH;
+  process.env.PATH = `${bin}${path.delimiter}${previous}`;
+  t.after(() => {
+    process.env.PATH = previous;
+  });
+  const credentialId = randomUUID();
+  f.project.repoUrl = 'https://example.invalid/team/repo.git';
+  f.project.buildCredentialId = credentialId;
+  const credentials = {
+    [credentialId]: {
+      type: 'git-https',
+      authType: 'password',
+      username: 'fixture-user',
+      password: 'fixture-token',
+    },
+  };
+  await assert.rejects(executeBuild(f.options(f.run(), { credentials })), /需要 Git 2\.32 或以上/);
+  assert.deepEqual(JSON.parse(await fs.readFile(marker, 'utf8')), {
+    args: ['--version'],
+    helperPresent: false,
+  });
+  assert.deepEqual(await fs.readdir(path.join(f.config.dataDir, 'workspaces')), []);
 });

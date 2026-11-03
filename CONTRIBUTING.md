@@ -12,7 +12,7 @@ cp .env.example .env
 npm run dev
 ```
 
-前端地址为 `http://127.0.0.1:5173`。Node.js 构建任务默认需要 Docker；开发环境与部署说明见 [README](README.md) 和 [配置说明](docs/configuration.md)。测试会自行创建临时目录，不需要生产数据库、真实 SSH 凭据或运行中的 Docker。
+前端地址为 `http://127.0.0.1:5173`。Node.js 构建任务默认需要 Docker；开发环境与部署说明见 [README](README.md) 和 [配置说明](docs/configuration.md)。自动化测试需要 Git 2.32+ 与 OpenSSL，会自行创建临时目录、TLS 证书和本机 Git 服务，不需要生产数据库、真实仓库凭据或运行中的 Docker。
 
 ## 代码组织与验证
 

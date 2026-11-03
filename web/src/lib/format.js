@@ -1,3 +1,5 @@
+import { credentialTypeLabel } from './credentials.js';
+
 export function date(value, full = false) {
   if (!value) return '—';
   const parsed = new Date(value);
@@ -30,5 +32,5 @@ export function executionDirectory(run) {
 }
 
 export function credentialLabel(credential) {
-  return `${credential.name}（${credential.authType === 'password' ? '密码' : '私钥'}）`;
+  return `${credential.name}（${credentialTypeLabel(credential)}）`;
 }
