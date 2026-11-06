@@ -14,7 +14,7 @@ function collect(directory) {
   }
 }
 
-for (const directory of ['server', 'scripts', 'tests', 'web', 'deploy']) {
+for (const directory of ['server', 'scripts', 'tests', 'web', 'deploy', 'shared']) {
   collect(path.join(root, directory));
 }
 

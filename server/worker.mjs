@@ -78,7 +78,13 @@ export async function runWorker(config, { signal, once = false } = {}) {
         activeController = new AbortController();
         const project = run.projectSnapshot;
         const credentials = {};
-        for (const id of [project.buildCredentialId, project.deploy.credentialId].filter(Boolean)) {
+        for (const id of new Set(
+          [
+            project.buildCredentialId,
+            ...(project.sources || []).map((source) => source.buildCredentialId),
+            project.deploy.credentialId,
+          ].filter(Boolean),
+        )) {
           const credential = store.getCredential(id);
           if (credential) credentials[id] = credential;
         }

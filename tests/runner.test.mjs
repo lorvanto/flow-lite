@@ -15,6 +15,7 @@ import {
 } from '../server/runners/build.mjs';
 import { runProcess } from '../server/lib/process.mjs';
 import { createGitHttpsFixture } from './helpers/git-https.mjs';
+import { createGitHttpFixture } from './helpers/git-http.mjs';
 
 test('Node image selection keeps version tags while allowing alternate registries', () => {
   assert.equal(nodeImageName('14'), 'node:14-bullseye');
@@ -645,4 +646,81 @@ test('HTTPS credentials fail closed on Git older than 2.32 before a helper is cr
     helperPresent: false,
   });
   assert.deepEqual(await fs.readdir(path.join(f.config.dataDir, 'workspaces')), []);
+});
+
+test('runner checks approved HTTP independently and requires its Git account credential', async (t) => {
+  const f = await fixture(t);
+  for (const url of [
+    'http://other.invalid/mini-program/baking.git',
+    'http://git.yin-duo.com/mini-program/hanfu.git',
+  ]) {
+    f.project.repoUrl = url;
+    await assert.rejects(executeBuild(f.options()), /HTTP 仅支持/);
+  }
+  f.project.repoUrl = 'http://git.yin-duo.com/mini-program/baking.git';
+  await assert.rejects(executeBuild(f.options()), /需要选择 Git/);
+  const id = randomUUID();
+  f.project.buildCredentialId = id;
+  await assert.rejects(
+    executeBuild(
+      f.options(f.run(), {
+        credentials: { [id]: { type: 'ssh', authType: 'password', password: 'fixture-only' } },
+      }),
+    ),
+    /HTTP 仓库需要 Git HTTPS/,
+  );
+  assert.deepEqual(await fs.readdir(path.join(f.config.dataDir, 'workspaces')), []);
+});
+
+test('real approved HTTP retry cleans in-memory credentials before checkout and build', async (t) => {
+  const f = await fixture(t);
+  await fs.writeFile(path.join(f.repo, 'page.txt'), '<h1>advanced</h1>');
+  await f.git(['add', '.']);
+  await f.git(['commit', '-m', 'advance HTTP fixture']);
+  const remote = await createGitHttpFixture(t, { repoDir: f.repo });
+  const trace = await remote.installGitProxyShim();
+  const id = randomUUID();
+  f.project.repoUrl = remote.url;
+  f.project.buildCredentialId = id;
+  f.project.buildCommand +=
+    ' && node -e "if(process.env.FLOW_GIT_CREDENTIAL_DATA||process.env.FLOW_GIT_CREDENTIAL_FILE||process.env.GIT_CONFIG_COUNT)process.exit(53)"';
+  const result = await executeBuild(
+    f.options(f.run({ commitSha: f.commit }), {
+      credentials: {
+        [id]: {
+          type: 'git-https',
+          authType: 'password',
+          username: remote.username,
+          password: remote.password,
+        },
+      },
+      onMetadata: async (value) => {
+        if (!value.commitSha) return;
+        const [run] = await fs.readdir(path.join(f.config.dataDir, 'workspaces'));
+        const root = path.join(f.config.dataDir, 'workspaces', run);
+        assert.ok((await fs.readdir(root)).every((name) => !name.startsWith('git-https-')));
+        const config = await fs.readFile(path.join(root, 'source/.git/config'), 'utf8');
+        assert.ok(config.includes(remote.url));
+        assert.equal(config.includes(remote.password), false);
+        assert.equal(config.includes('credential'), false);
+      },
+    }),
+  );
+  assert.equal(result.commitSha, f.commit);
+  assert.equal(
+    await fs.readFile(path.join(result.artifactPath, 'index.html'), 'utf8'),
+    '<h1>version one</h1>',
+  );
+  const calls = (await fs.readFile(trace, 'utf8'))
+    .trim()
+    .split('\n')
+    .map((line) => JSON.parse(line));
+  assert.ok(
+    calls.some((call) => call.command === 'clone' && call.memoryAuth && call.protocols === 'http'),
+  );
+  assert.ok(calls.some((call) => call.command === 'fetch' && call.memoryAuth));
+  assert.ok(calls.some((call) => call.command === 'checkout' && !call.memoryAuth));
+  assert.ok(
+    remote.requests.every((request) => request.host === 'git.yin-duo.com' && !request.hadCookie),
+  );
 });

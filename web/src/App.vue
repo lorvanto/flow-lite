@@ -1,4 +1,11 @@
 <script setup>
+import {
+  environmentText,
+  parseEnvironment,
+  taskPayloads,
+  isMultiBuild,
+  multiBuildSummary,
+} from './lib/multi-build.js';
 import { computed, onMounted, onUnmounted, ref, watch } from 'vue';
 import {
   Activity,
@@ -125,9 +132,13 @@ const filteredProjects = computed(() =>
     return (
       (group.value === null || (group.value === '' ? !p.group : p.group === group.value)) &&
       (!query ||
-        [p.name, p.repoUrl, p.group, p.description].some((s) =>
-          s?.toLowerCase().includes(query),
-        )) &&
+        [
+          p.name,
+          p.repoUrl,
+          p.group,
+          p.description,
+          ...(p.sources || []).map((source) => source.repoUrl),
+        ].some((s) => s?.toLowerCase().includes(query))) &&
       (filter.value === 'all' ||
         (filter.value === 'idle' ? !p.latestRun : p.latestRun?.status === filter.value))
     );
@@ -278,6 +289,7 @@ function newProject(project = null) {
     name: '',
     group: group.value || '',
     description: '',
+    buildMode: 'single',
     repoUrl: '',
     branch: 'main',
     nodeVersion: '24',
@@ -298,24 +310,22 @@ function newProject(project = null) {
   form.value.envText = Object.entries(form.value.environment || {})
     .map(([key, value]) => `${key}=${value}`)
     .join('\n');
+  for (const task of form.value.tasks || []) task.envText = environmentText(task.environment);
   modal.value = 'project';
 }
 async function saveProject() {
   formError.value = '';
   busy.value = 'save-project';
   try {
-    const environment = {};
-    for (const [index, line] of form.value.envText.split('\n').entries()) {
-      if (!line.trim() || line.trim().startsWith('#')) continue;
-      const separator = line.indexOf('=');
-      const key = line.slice(0, separator).trim();
-      if (separator < 1 || !/^[a-zA-Z_][a-zA-Z0-9_]*$/.test(key))
-        throw new Error(`环境变量第 ${index + 1} 行格式有误，请使用 KEY=value`);
-      environment[key] = line.slice(separator + 1);
-    }
+    const environment = parseEnvironment(form.value.envText);
     const { envText, latestRun, currentReleaseId, createdAt, updatedAt, id, ...values } =
       form.value;
     values.environment = environment;
+    if (values.buildMode === 'multi') values.tasks = taskPayloads(values.tasks);
+    else {
+      delete values.sources;
+      delete values.tasks;
+    }
     values.buildCredentialId ||= null;
     values.deploy.credentialId ||= null;
     values.deploy.port = Number(values.deploy.port || 22);
@@ -935,7 +945,11 @@ onUnmounted(() => {
                           <small>
                             {{
                               project.description ||
-                              (isCommand(project) ? project.deploy.root : repoName(project.repoUrl))
+                              (isCommand(project)
+                                ? project.deploy.root
+                                : isMultiBuild(project)
+                                  ? multiBuildSummary(project)
+                                  : repoName(project.repoUrl))
                             }}
                           </small>
                         </span>
@@ -967,9 +981,11 @@ onUnmounted(() => {
                       <span v-else class="node-badge">
                         <span class="node-hex">N</span>
                         {{
-                          project.nodeVersion === 'auto'
-                            ? '自动识别'
-                            : 'Node ' + project.nodeVersion
+                          isMultiBuild(project)
+                            ? `${project.tasks.length} 个构建任务`
+                            : project.nodeVersion === 'auto'
+                              ? '自动识别'
+                              : 'Node ' + project.nodeVersion
                         }}
                       </span>
                     </td>
@@ -1036,7 +1052,11 @@ onUnmounted(() => {
               <p>
                 {{
                   activeProject.description ||
-                  (isCommand(activeProject) ? 'PHP / 命令发布' : repoName(activeProject.repoUrl))
+                  (isCommand(activeProject)
+                    ? 'PHP / 命令发布'
+                    : isMultiBuild(activeProject)
+                      ? multiBuildSummary(activeProject)
+                      : repoName(activeProject.repoUrl))
                 }}
               </p>
             </div>
@@ -1113,7 +1133,13 @@ onUnmounted(() => {
                 <GitBranch :size="14" />
                 代码分支
               </span>
-              <strong>{{ activeProject.branch }}</strong>
+              <strong>{{
+                isMultiBuild(activeProject)
+                  ? activeProject.sources
+                      .map((source) => source.name + ': ' + source.branch)
+                      .join(' / ')
+                  : activeProject.branch
+              }}</strong>
             </div>
             <div>
               <span class="metadata-label">
@@ -1122,8 +1148,18 @@ onUnmounted(() => {
               </span>
               <strong>
                 Node.js
-                {{ activeProject.nodeVersion === 'auto' ? '自动识别' : activeProject.nodeVersion }}
-                <small>· {{ activeProject.packageManager }}</small>
+                {{
+                  isMultiBuild(activeProject)
+                    ? activeProject.tasks
+                        .map((task) => task.name + ': ' + task.nodeVersion)
+                        .join(' / ')
+                    : activeProject.nodeVersion === 'auto'
+                      ? '自动识别'
+                      : activeProject.nodeVersion
+                }}
+                <small v-if="!isMultiBuild(activeProject)"
+                  >· {{ activeProject.packageManager }}</small
+                >
               </strong>
             </div>
             <div>

@@ -23,13 +23,31 @@ export function createStore(config) {
       id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES projects(id), number INTEGER NOT NULL,
       kind TEXT NOT NULL, status TEXT NOT NULL, stage TEXT NOT NULL, snapshot TEXT NOT NULL,
       rollback_release_id TEXT, commit_sha TEXT, node_version TEXT, package_manager_version TEXT,
-      artifact_path TEXT, release_path TEXT, error TEXT, cancel_requested INTEGER NOT NULL DEFAULT 0,
+      artifact_path TEXT, release_path TEXT, error TEXT, build_details TEXT, cancel_requested INTEGER NOT NULL DEFAULT 0,
       created_at TEXT NOT NULL, started_at TEXT, finished_at TEXT,
       UNIQUE(project_id,number)
     );
     CREATE INDEX IF NOT EXISTS runs_queue ON runs(status,created_at);
     CREATE INDEX IF NOT EXISTS runs_project ON runs(project_id,created_at);
   `);
+  if (
+    !db
+      .prepare('PRAGMA table_info(runs)')
+      .all()
+      .some((column) => column.name === 'build_details')
+  ) {
+    try {
+      db.exec('ALTER TABLE runs ADD COLUMN build_details TEXT');
+    } catch (error) {
+      if (
+        !db
+          .prepare('PRAGMA table_info(runs)')
+          .all()
+          .some((column) => column.name === 'build_details')
+      )
+        throw error;
+    }
+  }
   const setting = (key) => {
     const row = db.prepare('SELECT value FROM settings WHERE key=?').get(key);
     return row ? JSON.parse(row.value) : null;
@@ -61,6 +79,7 @@ export function createStore(config) {
           stage: row.stage,
           rollbackReleaseId: row.rollback_release_id,
           commitSha: row.commit_sha,
+          buildDetails: row.build_details ? JSON.parse(row.build_details) : null,
           nodeVersion: row.node_version,
           packageManagerVersion: row.package_manager_version,
           artifactPath: row.artifact_path,
@@ -168,6 +187,7 @@ export function createStore(config) {
         status: 'status',
         stage: 'stage',
         commitSha: 'commit_sha',
+        buildDetails: 'build_details',
         nodeVersion: 'node_version',
         packageManagerVersion: 'package_manager_version',
         artifactPath: 'artifact_path',
@@ -182,8 +202,12 @@ export function createStore(config) {
         db.prepare(
           `UPDATE runs SET ${pairs.map(([key]) => `${mapping[key]}=?`).join(',')} WHERE id=?`,
         ).run(
-          ...pairs.map(([, value]) =>
-            typeof value === 'boolean' ? Number(value) : (value ?? null),
+          ...pairs.map(([key, value]) =>
+            key === 'buildDetails'
+              ? JSON.stringify(value)
+              : typeof value === 'boolean'
+                ? Number(value)
+                : (value ?? null),
           ),
           id,
         );

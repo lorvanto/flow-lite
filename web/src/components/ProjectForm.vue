@@ -1,5 +1,7 @@
 <script setup>
 import { computed, ref, watch } from 'vue';
+import MultiBuildFields from './MultiBuildFields.vue';
+import { enableMultiBuild } from '../lib/multi-build.js';
 import {
   Box,
   CheckCircle2,
@@ -13,6 +15,7 @@ import {
 } from '@lucide/vue';
 import { credentialLabel } from '../lib/format.js';
 import { matchesRepository } from '../lib/credentials.js';
+import { isAllowedHttpGitRepository } from '../../../shared/repository-policy.mjs';
 
 const form = defineModel({ type: Object, required: true });
 const props = defineProps({
@@ -156,6 +159,31 @@ function changeManager() {
         </div>
       </div>
       <div v-if="form.type !== 'command'" class="form-section">
+        <div class="segmented-control" aria-label="构建模式">
+          <button
+            type="button"
+            :class="{ active: form.buildMode !== 'multi' }"
+            @click="form.buildMode = 'single'"
+          >
+            单任务构建
+          </button>
+          <button
+            type="button"
+            :class="{ active: form.buildMode === 'multi' }"
+            @click="enableMultiBuild(form)"
+          >
+            多任务构建
+          </button>
+        </div>
+        <small>多任务可复用同一仓库，或从不同仓库分别构建 admin、H5、PC。</small>
+      </div>
+      <MultiBuildFields
+        v-if="form.type !== 'command' && form.buildMode === 'multi'"
+        v-model="form"
+        :credentials="credentials"
+        :node-versions="nodeVersions"
+      />
+      <div v-if="form.type !== 'command' && form.buildMode !== 'multi'" class="form-section">
         <div class="form-section-title">
           <span>02</span>
           <h3>代码来源</h3>
@@ -172,6 +200,9 @@ function changeManager() {
               placeholder="git@github.com:team/project.git 或 HTTPS 地址"
             />
             <small>HTTPS 或 SSH 地址可选择对应仓库凭据，请勿在地址中填写密码或令牌。</small>
+            <small v-if="isAllowedHttpGitRepository(form.repoUrl.trim())">
+              此仓库使用 HTTP，传输未加密。请选择 Git 账号密码凭据，仅连接已批准的仓库地址。
+            </small>
           </label>
           <label class="field">
             <span>
@@ -182,8 +213,14 @@ function changeManager() {
           </label>
           <label class="field">
             仓库凭据
-            <select v-model="form.buildCredentialId" aria-label="仓库凭据">
-              <option :value="null">无需凭据 / 使用服务器现有配置</option>
+            <select
+              v-model="form.buildCredentialId"
+              aria-label="仓库凭据"
+              :required="isAllowedHttpGitRepository(form.repoUrl.trim())"
+            >
+              <option :value="null" :disabled="isAllowedHttpGitRepository(form.repoUrl.trim())">
+                无需凭据 / 使用服务器现有配置
+              </option>
               <option
                 v-for="credential in repositoryCredentials"
                 :key="credential.id"
@@ -195,7 +232,7 @@ function changeManager() {
           </label>
         </div>
       </div>
-      <div v-if="form.type !== 'command'" class="form-section">
+      <div v-if="form.type !== 'command' && form.buildMode !== 'multi'" class="form-section">
         <div class="form-section-title">
           <span>03</span>
           <h3>构建配置</h3>

@@ -1,4 +1,5 @@
 import path from 'node:path';
+import { isAllowedHttpGitRepository } from '../../shared/repository-policy.mjs';
 
 export function fail(message, statusCode = 400) {
   const error = new Error(message);
@@ -61,6 +62,8 @@ export function validateProject(input, config) {
       fail('请填写执行命令，最多 100 KB 且不能包含空字符');
     return { ...common, commands: input.commands.replace(/\r\n?/g, '\n'), buildCredentialId: null };
   }
+  if (input.buildMode === 'multi') return validateMultiProject(input, config, common);
+  if (input.buildMode !== undefined && input.buildMode !== 'single') fail('构建模式无效');
   const repoUrl = string(input.repoUrl, 'Git 仓库地址', 2000);
   if (!repoUrl || /[\r\n\s]/.test(repoUrl) || repoUrl.startsWith('-'))
     fail('Git 仓库地址格式不正确');
@@ -74,6 +77,11 @@ export function validateProject(input, config) {
     if (url.username || url.password)
       fail('请在凭据管理中保存仓库账号密码，不要在 URL 中填写账号、密码或令牌');
     if (!url.hostname) fail('Git 仓库地址缺少主机');
+  } else if (/^http:\/\//i.test(repoUrl)) {
+    if (!isAllowedHttpGitRepository(repoUrl))
+      fail('HTTP 仅支持已批准的 git.yin-duo.com/mini-program 仓库地址');
+    if (!credentialId(input.buildCredentialId, '仓库凭据'))
+      fail('该 HTTP 仓库需要选择 Git 账号密码凭据');
   } else if (/^ssh:\/\//.test(repoUrl)) {
     let url;
     try {
@@ -136,6 +144,101 @@ export function validateProject(input, config) {
     artifactDir: relative(input.artifactDir, '产物目录', 'dist'),
     retainReleases: integer(input.retainReleases, '保留版本数', 1, 30, 5),
     buildCredentialId: credentialId(input.buildCredentialId, '仓库凭据'),
+  };
+}
+
+function validateMultiProject(input, config, common) {
+  if (!Array.isArray(input.sources) || input.sources.length < 1 || input.sources.length > 8)
+    fail('请配置 1～8 个代码源');
+  if (!Array.isArray(input.tasks) || input.tasks.length < 1 || input.tasks.length > 12)
+    fail('请配置 1～12 个构建任务');
+  const identity = (item, label) => {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) fail(`${label}格式不正确`);
+    const id = string(item.id, `${label}标识`, 40);
+    if (!/^[a-z][a-z0-9_-]{0,39}$/.test(id))
+      fail(`${label}标识需以小写字母开头，只含字母、数字、下划线或短横线`);
+    const name = string(item.name, `${label}名称`, 80);
+    if (!name || /[\r\n]/.test(name)) fail(`请填写${label}名称`);
+    return { id, name };
+  };
+  const sources = input.sources.map((source) => {
+    const item = identity(source, '代码源');
+    const validated = validateProject(
+      {
+        name: item.name,
+        deploy: common.deploy,
+        repoUrl: source.repoUrl,
+        branch: source.branch,
+        buildCredentialId: source.buildCredentialId,
+      },
+      config,
+    );
+    return {
+      ...item,
+      repoUrl: validated.repoUrl,
+      branch: validated.branch,
+      buildCredentialId: validated.buildCredentialId,
+    };
+  });
+  if (new Set(sources.map((source) => source.id)).size !== sources.length)
+    fail('代码源标识不能重复');
+  if (
+    new Set(
+      sources.map((source) =>
+        JSON.stringify([source.repoUrl, source.branch, source.buildCredentialId]),
+      ),
+    ).size !== sources.length
+  )
+    fail('相同仓库、分支和凭据请复用已有代码源');
+  const tasks = input.tasks.map((task) => {
+    const item = identity(task, '构建任务');
+    const source = sources.find((source) => source.id === task.sourceId);
+    if (!source) fail('构建任务必须选择已配置的代码源');
+    const validated = validateProject(
+      {
+        ...task,
+        ...common,
+        name: item.name,
+        type: 'node',
+        buildMode: 'single',
+        ...source,
+        environment: task.environment ?? {},
+      },
+      config,
+    );
+    const publishDir = path.posix.normalize(relative(task.publishDir, '发布子目录', '.'));
+    if (/[\r\n]/.test(publishDir) || publishDir.startsWith('-')) fail('发布子目录格式不正确');
+    if (path.posix.normalize(validated.artifactDir) === '.') fail('产物目录不能是整个工作目录');
+    return {
+      ...item,
+      sourceId: source.id,
+      workdir: validated.workdir,
+      nodeVersion: validated.nodeVersion,
+      packageManager: validated.packageManager,
+      packageManagerVersion: validated.packageManagerVersion,
+      installCommand: validated.installCommand,
+      buildCommand: validated.buildCommand,
+      artifactDir: validated.artifactDir,
+      publishDir,
+      environment: validated.environment,
+    };
+  });
+  if (new Set(tasks.map((task) => task.id)).size !== tasks.length) fail('构建任务标识不能重复');
+  if (sources.some((source) => !tasks.some((task) => task.sourceId === source.id)))
+    fail('每个代码源至少需要一个构建任务');
+  for (let i = 0; i < tasks.length; i++)
+    for (let j = 0; j < i; j++) {
+      const a = tasks[i].publishDir,
+        b = tasks[j].publishDir;
+      if (a === '.' || b === '.' || a === b || a.startsWith(b + '/') || b.startsWith(a + '/'))
+        fail('各任务的发布子目录不能相同或互相包含');
+    }
+  return {
+    ...common,
+    buildMode: 'multi',
+    sources,
+    tasks,
+    retainReleases: integer(input.retainReleases, '保留版本数', 1, 30, 5),
   };
 }
 

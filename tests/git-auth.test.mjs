@@ -6,6 +6,7 @@ import os from 'node:os';
 import { runProcess } from '../server/lib/process.mjs';
 import { prepareGitHttpsAuth } from '../server/runners/git-auth.mjs';
 import { createGitHttpsFixture } from './helpers/git-https.mjs';
+import { createGitHttpFixture } from './helpers/git-http.mjs';
 
 async function temporary(t) {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'flow-git-auth-test-'));
@@ -197,4 +198,135 @@ test('Git HTTPS helper refuses wrong types, unsafe URLs, usernames and multiline
         tempDir,
       }),
     );
+});
+
+test('approved HTTP credentials stay in process memory and release only exact protocol/host/path', async (t) => {
+  const tempDir = await temporary(t);
+  const auth = await prepareGitHttpsAuth({
+    credential,
+    repoUrl: 'http://git.yin-duo.com/mini-program/baking.git',
+    tempDir,
+    env: base(),
+  });
+  assert.equal(auth.env.GIT_ALLOW_PROTOCOL, 'http');
+  assert.equal(auth.env.FLOW_GIT_CREDENTIAL_FILE, undefined);
+  const [directory] = await fs.readdir(tempDir);
+  assert.deepEqual(await fs.readdir(path.join(tempDir, directory)), ['helper.cjs']);
+  assert.equal(
+    (await fs.readFile(path.join(tempDir, directory, 'helper.cjs'), 'utf8')).includes(
+      credential.password,
+    ),
+    false,
+  );
+  const input = 'protocol=http\nhost=git.yin-duo.com\npath=mini-program/baking.git\n\n';
+  const filled = await runProcess('git', ['credential', 'fill'], {
+    env: auth.env,
+    cwd: tempDir,
+    input,
+  });
+  assert.ok(filled.stdout.includes(`password=${credential.password}\n`));
+  for (const other of [
+    input.replace('protocol=http', 'protocol=https'),
+    input.replace('git.yin-duo.com', 'other.invalid'),
+    input.replace('git.yin-duo.com', 'git.yin-duo.com:8080'),
+    input.replace('baking.git', 'coffee.git'),
+    input.replace('baking.git', 'baking.git/'),
+    input.replace('path=mini-program', 'path=/mini-program'),
+    input.replace('baking.git', '%62aking.git'),
+    `${input.trim()}\nusername=someone-else\n\n`,
+  ])
+    await assert.rejects(
+      runProcess('git', ['credential', 'fill'], { env: auth.env, cwd: tempDir, input: other }),
+    );
+  await auth.cleanup();
+  assert.equal(auth.env.FLOW_GIT_CREDENTIAL_DATA, undefined);
+  assert.deepEqual(await fs.readdir(tempDir), []);
+});
+
+test('yshop and yshopbbc HTTP credentials remain bound to each exact repository', async (t) => {
+  const tempDir = await temporary(t);
+  for (const slug of ['yshop', 'yshopbbc']) {
+    const auth = await prepareGitHttpsAuth({
+      credential,
+      repoUrl: `http://git.yin-duo.com/mini-program/${slug}.git`,
+      tempDir,
+      env: base(),
+    });
+    try {
+      const input = `protocol=http\nhost=git.yin-duo.com\npath=mini-program/${slug}.git\n\n`;
+      const filled = await runProcess('git', ['credential', 'fill'], {
+        env: auth.env,
+        cwd: tempDir,
+        input,
+      });
+      assert.ok(filled.stdout.includes(`password=${credential.password}\n`));
+      assert.equal(auth.env.FLOW_GIT_CREDENTIAL_FILE, undefined);
+      for (const other of [
+        input.replace(`${slug}.git`, `${slug === 'yshop' ? 'yshopbbc' : 'yshop'}.git`),
+        input.replace('protocol=http', 'protocol=https'),
+        input.replace('git.yin-duo.com', 'git.yin-duo.com:8080'),
+        input.replace('git.yin-duo.com', 'other.invalid'),
+        input.replace('path=mini-program', 'path=other'),
+        input.replace(`${slug}.git`, `${slug}.git/`),
+      ])
+        await assert.rejects(
+          runProcess('git', ['credential', 'fill'], { env: auth.env, cwd: tempDir, input: other }),
+        );
+      const config = await runProcess('git', ['config', '--get', 'http.followRedirects'], {
+        env: auth.env,
+        cwd: tempDir,
+      });
+      assert.equal(config.stdout.trim(), 'false');
+    } finally {
+      await auth.cleanup();
+    }
+    assert.equal(auth.env.FLOW_GIT_CREDENTIAL_DATA, undefined);
+    assert.deepEqual(await fs.readdir(tempDir), []);
+  }
+});
+
+test('real allowlisted HTTP clone authenticates without plaintext storage, cookies or redirect forwarding', async (t) => {
+  const fixture = await createGitHttpFixture(t);
+  const tempDir = await temporary(t);
+  const secret = {
+    type: 'git-https',
+    authType: 'password',
+    username: fixture.username,
+    password: fixture.password,
+  };
+  const auth = await prepareGitHttpsAuth({
+    credential: secret,
+    repoUrl: fixture.url,
+    tempDir,
+    env: base(),
+  });
+  await fixture.runGit(['clone', '--depth', '1', '--', fixture.url, path.join(tempDir, 'clone')], {
+    env: auth.env,
+  });
+  assert.equal(
+    await fs.readFile(path.join(tempDir, 'clone/README.txt'), 'utf8'),
+    'real TLS Git fixture\n',
+  );
+  const stored = await fs.readFile(path.join(tempDir, 'clone/.git/config'), 'utf8');
+  assert.ok(stored.includes(fixture.url));
+  for (const text of [fixture.password, 'credential', 'helper.cjs'])
+    assert.equal(stored.includes(text), false);
+  for (const redirect of [
+    'http://other.invalid/mini-program/baking.git/info/refs?service=git-upload-pack',
+    'https://git.yin-duo.com/mini-program/baking.git/info/refs?service=git-upload-pack',
+    'http://git.yin-duo.com/mini-program/coffee.git/info/refs?service=git-upload-pack',
+  ]) {
+    fixture.setRedirect(redirect);
+    await assert.rejects(fixture.runGit(['ls-remote', fixture.url], { env: auth.env }));
+  }
+  assert.ok(fixture.requests.some((request) => request.authenticated));
+  assert.ok(
+    fixture.requests.every(
+      (request) =>
+        request.host === 'git.yin-duo.com' && request.path.startsWith('/mini-program/baking.git/'),
+    ),
+  );
+  assert.ok(fixture.requests.every((request) => !request.hadCookie));
+  await auth.cleanup();
+  assert.equal(auth.env.FLOW_GIT_CREDENTIAL_DATA, undefined);
 });

@@ -5,6 +5,7 @@ export function secretValues(project, credentials) {
   const items = credentials instanceof Map ? [...credentials.values()] : Object.values(credentials);
   const values = [
     ...Object.values(project.environment || {}),
+    ...(project.tasks || []).flatMap((task) => Object.values(task.environment || {})),
     ...items.flatMap((item) =>
       (item.privateKey || '').split(/\r?\n/).filter((line) => !line.startsWith('-----')),
     ),
@@ -18,6 +19,7 @@ export function secretValues(project, credentials) {
   for (const item of items) {
     if (item.type !== 'git-https' || typeof item.password !== 'string' || !item.password) continue;
     values.push(encodeURIComponent(item.password.toWellFormed()));
+    values.push(JSON.stringify(item.password).slice(1, -1));
     if (typeof item.username === 'string') {
       values.push(Buffer.from(`${item.username}:${item.password}`, 'utf8').toString('base64'));
     }
