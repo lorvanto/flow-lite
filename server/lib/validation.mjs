@@ -1,4 +1,5 @@
 import path from 'node:path';
+import { isAllowedHttpGitRepository } from '../../shared/repository-policy.mjs';
 
 export function fail(message, statusCode = 400) {
   const error = new Error(message);
@@ -74,6 +75,11 @@ export function validateProject(input, config) {
     if (url.username || url.password)
       fail('请在凭据管理中保存仓库账号密码，不要在 URL 中填写账号、密码或令牌');
     if (!url.hostname) fail('Git 仓库地址缺少主机');
+  } else if (/^http:\/\//i.test(repoUrl)) {
+    if (!isAllowedHttpGitRepository(repoUrl))
+      fail('HTTP 仅支持已批准的 git.yin-duo.com/mini-program 仓库地址');
+    if (!credentialId(input.buildCredentialId, '仓库凭据'))
+      fail('该 HTTP 仓库需要选择 Git 账号密码凭据');
   } else if (/^ssh:\/\//.test(repoUrl)) {
     let url;
     try {

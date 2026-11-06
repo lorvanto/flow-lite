@@ -13,6 +13,7 @@ import {
 } from '@lucide/vue';
 import { credentialLabel } from '../lib/format.js';
 import { matchesRepository } from '../lib/credentials.js';
+import { isAllowedHttpGitRepository } from '../../../shared/repository-policy.mjs';
 
 const form = defineModel({ type: Object, required: true });
 const props = defineProps({
@@ -172,6 +173,9 @@ function changeManager() {
               placeholder="git@github.com:team/project.git 或 HTTPS 地址"
             />
             <small>HTTPS 或 SSH 地址可选择对应仓库凭据，请勿在地址中填写密码或令牌。</small>
+            <small v-if="isAllowedHttpGitRepository(form.repoUrl.trim())">
+              此仓库使用 HTTP，传输未加密。请选择 Git 账号密码凭据，仅连接已批准的仓库地址。
+            </small>
           </label>
           <label class="field">
             <span>
@@ -182,8 +186,14 @@ function changeManager() {
           </label>
           <label class="field">
             仓库凭据
-            <select v-model="form.buildCredentialId" aria-label="仓库凭据">
-              <option :value="null">无需凭据 / 使用服务器现有配置</option>
+            <select
+              v-model="form.buildCredentialId"
+              aria-label="仓库凭据"
+              :required="isAllowedHttpGitRepository(form.repoUrl.trim())"
+            >
+              <option :value="null" :disabled="isAllowedHttpGitRepository(form.repoUrl.trim())">
+                无需凭据 / 使用服务器现有配置
+              </option>
               <option
                 v-for="credential in repositoryCredentials"
                 :key="credential.id"

@@ -7,6 +7,7 @@ import { runProcess, checkAbort } from '../lib/process.mjs';
 import { validateNodeImagePrefix } from '../config.mjs';
 import { prepareSshAuth } from './ssh-auth.mjs';
 import { prepareGitHttpsAuth } from './git-auth.mjs';
+import { isAllowedHttpGitRepository } from '../../shared/repository-policy.mjs';
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const VERSION = /^(?:v)?(\d{1,2})(?:\.(\d{1,3}))?(?:\.(\d{1,3}))?$/;
@@ -99,6 +100,11 @@ function assertRepository(repoUrl, config) {
     const url = new URL(repoUrl);
     if (url.username || url.password)
       throw new Error('请通过凭据配置账号、密码或令牌，不要写入 Git 仓库地址');
+    return;
+  }
+  if (/^http:\/\//i.test(repoUrl)) {
+    if (!isAllowedHttpGitRepository(repoUrl))
+      throw new Error('HTTP 仅支持已批准的 git.yin-duo.com/mini-program 仓库地址');
     return;
   }
   if (/^ssh:\/\//i.test(repoUrl)) {
@@ -690,17 +696,23 @@ export async function executeBuild(options) {
     await onStage('checkout');
     await onLog(`检出仓库分支：${branch}\n`);
     const credential = lookupCredential(credentials, project.buildCredentialId);
+    const approvedHttp = isAllowedHttpGitRepository(project.repoUrl);
     const gitBase = {
       ...baseEnvironment(),
       GIT_TERMINAL_PROMPT: '0',
       GIT_CONFIG_GLOBAL: '/dev/null',
       GIT_CONFIG_NOSYSTEM: '1',
-      GIT_ALLOW_PROTOCOL: config.allowLocalRepositories ? 'https:ssh:file' : 'https:ssh',
+      GIT_ALLOW_PROTOCOL: approvedHttp
+        ? 'http'
+        : config.allowLocalRepositories
+          ? 'https:ssh:file'
+          : 'https:ssh',
     };
     let gitEnv;
-    if (/^https:\/\//i.test(project.repoUrl)) {
+    if (/^https:\/\//i.test(project.repoUrl) || approvedHttp) {
+      if (approvedHttp && !credential) throw new Error('该 HTTP 仓库需要选择 Git 账号密码凭据');
       if (credential && credential.type !== 'git-https')
-        throw new Error('HTTPS 仓库需要 Git HTTPS 账号密码或令牌凭据');
+        throw new Error(`${approvedHttp ? 'HTTP' : 'HTTPS'} 仓库需要 Git HTTPS 账号密码或令牌凭据`);
       if (credential) {
         await requireGitHttpsIsolation(gitBase, signal);
         httpsAuth = await prepareGitHttpsAuth({

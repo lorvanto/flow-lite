@@ -18,6 +18,7 @@ export function secretValues(project, credentials) {
   for (const item of items) {
     if (item.type !== 'git-https' || typeof item.password !== 'string' || !item.password) continue;
     values.push(encodeURIComponent(item.password.toWellFormed()));
+    values.push(JSON.stringify(item.password).slice(1, -1));
     if (typeof item.username === 'string') {
       values.push(Buffer.from(`${item.username}:${item.password}`, 'utf8').toString('base64'));
     }

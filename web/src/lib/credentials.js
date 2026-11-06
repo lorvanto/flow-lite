@@ -1,3 +1,5 @@
+import { isAllowedHttpGitRepository } from '../../../shared/repository-policy.mjs';
+
 export function createCredentialForm() {
   return {
     name: '',
@@ -31,7 +33,7 @@ export function credentialTypeLabel(credential) {
 
 export function repositoryCredentialType(repoUrl = '') {
   const url = repoUrl.trim();
-  if (/^https:\/\//i.test(url)) return 'git-https';
+  if (/^https:\/\//i.test(url) || isAllowedHttpGitRepository(url)) return 'git-https';
   if (/^ssh:\/\//i.test(url) || /^[\w.-]+@[^\s:]+:/.test(url)) return 'ssh';
   return null;
 }

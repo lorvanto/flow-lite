@@ -17,6 +17,7 @@ import {
   sameTarget,
 } from './lib/validation.mjs';
 import { projectRoot } from './config.mjs';
+import { isAllowedHttpGitRepository } from '../shared/repository-policy.mjs';
 
 const execFileAsync = promisify(execFile);
 const SESSION_SECONDS = 7 * 24 * 3600;
@@ -142,8 +143,11 @@ export async function createApp(config, options = {}) {
       const credential = store.getCredential(project.buildCredentialId);
       if (!credential) fail('所选仓库凭据不存在');
       const https = /^https:\/\//i.test(project.repoUrl || '');
-      if (https && credential.type !== 'git-https') fail('HTTPS 仓库请选择 Git HTTPS 账号密码凭据');
-      if (!https && credential.type !== 'ssh') fail('Git HTTPS 账号密码凭据只能用于 HTTPS 仓库');
+      const http = isAllowedHttpGitRepository(project.repoUrl);
+      if ((https || http) && credential.type !== 'git-https')
+        fail(`${http ? 'HTTP' : 'HTTPS'} 仓库请选择 Git HTTPS 账号密码凭据`);
+      if (!https && !http && credential.type !== 'ssh')
+        fail('Git HTTPS 账号密码凭据只能用于 HTTPS 或已批准的 HTTP 仓库');
     }
     if (project.deploy.type === 'ssh') {
       const credential = store.getCredential(project.deploy.credentialId);

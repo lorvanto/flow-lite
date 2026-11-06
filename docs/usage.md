@@ -65,6 +65,8 @@ Web 服务器的根目录指向 `/srv/sites/demo/current`。本机发布和 SSH 
 
 账号与密码 / 令牌加密保存在平台数据库中。HTTPS 证书仍须被执行机信任，平台不会自动关闭 TLS 校验；认证检出不自动跟随重定向，仓库迁移后请更新为服务提供的最终克隆地址。此凭据用于检出阶段的 Git 拉取，不传给依赖安装、构建容器或原地命令中的 Git 操作；如果项目在安装依赖时还需访问其他私有仓库，应单独配置相应认证。
 
+兼容例外仅适用于 `http://git.yin-duo.com/mini-program/<项目>.git`，项目限定为 baking、campsite、coffee、course、evse、flower、manhe、milktea、studyroom、tattoo、venue、vipcard、yanxi、yshop、yshopbbc。必须显式选择 Git 账号密码凭据；其他 HTTP 地址、端口、查询参数和 URL 内的账号密码均不接受。HTTP 传输未加密，请仅在接受该仓库连接方式时使用。凭据仍加密保存在平台数据库中，检出时仅通过进程内存交给限定协议、主机和仓库路径的 helper，不创建 HTTP 明文凭据文件、不持久化 Git 凭据，也不跟随重定向。
+
 ### SSH 私钥与密码
 
 SSH 凭据不包含登录用户名：在 SSH 目标中填写用户名，仓库连接则从 SSH Git 地址取得用户名。SSH 代码仓库和 SSH 部署目标分别选择凭据，也可以复用同一个 SSH 凭据。

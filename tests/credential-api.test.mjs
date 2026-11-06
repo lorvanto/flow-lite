@@ -10,6 +10,74 @@ import { encrypt } from '../server/lib/crypto.mjs';
 const fixtureKey =
   '-----BEGIN OPENSSH PRIVATE KEY-----\nfixture-only-private-key-body\n-----END OPENSSH PRIVATE KEY-----\n';
 
+test('approved HTTP projects use existing Git account credentials and reject SSH or missing credentials', async (t) => {
+  const f = await fixture(t);
+  const gitCredential = (
+    await f.request('POST', '/api/credentials', {
+      name: 'HTTP account fixture',
+      type: 'git-https',
+      authType: 'password',
+      username: 'fixture-user',
+      password: 'fixture-http-token',
+    })
+  ).body.credential;
+  const sshCredential = (
+    await f.request('POST', '/api/credentials', {
+      name: 'SSH fixture',
+      type: 'ssh',
+      authType: 'password',
+      password: 'fixture-ssh',
+    })
+  ).body.credential;
+  for (const slug of ['baking', 'yshop', 'yshopbbc']) {
+    const project = {
+      name: `HTTP project ${slug}`,
+      repoUrl: `http://git.yin-duo.com/mini-program/${slug}.git`,
+      deploy: { type: 'local', root: path.join(f.root, slug) },
+    };
+    assert.equal((await f.request('POST', '/api/projects', project)).code, 400);
+    assert.equal(
+      (
+        await f.request('POST', '/api/projects', {
+          ...project,
+          buildCredentialId: sshCredential.id,
+        })
+      ).code,
+      400,
+    );
+    const saved = await f.request('POST', '/api/projects', {
+      ...project,
+      buildCredentialId: gitCredential.id,
+    });
+    assert.equal(saved.code, 201);
+    assert.equal(saved.body.project.repoUrl, project.repoUrl);
+    assert.equal(saved.body.project.buildCredentialId, gitCredential.id);
+  }
+  metadataOnly(gitCredential);
+  const project = {
+    name: 'HTTP rejected fixture',
+    repoUrl: 'http://git.yin-duo.com/mini-program/baking.git',
+    deploy: { type: 'local', root: path.join(f.root, 'site') },
+  };
+  for (const repoUrl of [
+    project.repoUrl + '?token=x',
+    project.repoUrl.replace('git.yin-duo.com', 'other.invalid'),
+    project.repoUrl.replace('baking.git', 'hanfu.git'),
+    'http://git.yin-duo.com/mini-program/yshop-extra.git',
+    'http://git.yin-duo.com/other/yshopbbc.git',
+  ])
+    assert.equal(
+      (
+        await f.request('POST', '/api/projects', {
+          ...project,
+          repoUrl,
+          buildCredentialId: gitCredential.id,
+        })
+      ).code,
+      400,
+    );
+});
+
 async function fixture(t) {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'flow-credential-api-'));
   const config = getConfig({
