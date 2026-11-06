@@ -1,5 +1,7 @@
 <script setup>
 import { computed, ref, watch } from 'vue';
+import MultiBuildFields from './MultiBuildFields.vue';
+import { enableMultiBuild } from '../lib/multi-build.js';
 import {
   Box,
   CheckCircle2,
@@ -157,6 +159,31 @@ function changeManager() {
         </div>
       </div>
       <div v-if="form.type !== 'command'" class="form-section">
+        <div class="segmented-control" aria-label="构建模式">
+          <button
+            type="button"
+            :class="{ active: form.buildMode !== 'multi' }"
+            @click="form.buildMode = 'single'"
+          >
+            单任务构建
+          </button>
+          <button
+            type="button"
+            :class="{ active: form.buildMode === 'multi' }"
+            @click="enableMultiBuild(form)"
+          >
+            多任务构建
+          </button>
+        </div>
+        <small>多任务可复用同一仓库，或从不同仓库分别构建 admin、H5、PC。</small>
+      </div>
+      <MultiBuildFields
+        v-if="form.type !== 'command' && form.buildMode === 'multi'"
+        v-model="form"
+        :credentials="credentials"
+        :node-versions="nodeVersions"
+      />
+      <div v-if="form.type !== 'command' && form.buildMode !== 'multi'" class="form-section">
         <div class="form-section-title">
           <span>02</span>
           <h3>代码来源</h3>
@@ -205,7 +232,7 @@ function changeManager() {
           </label>
         </div>
       </div>
-      <div v-if="form.type !== 'command'" class="form-section">
+      <div v-if="form.type !== 'command' && form.buildMode !== 'multi'" class="form-section">
         <div class="form-section-title">
           <span>03</span>
           <h3>构建配置</h3>

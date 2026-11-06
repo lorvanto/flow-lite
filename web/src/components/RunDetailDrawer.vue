@@ -31,6 +31,15 @@ defineEmits(['close', 'cancel', 'retry', 'copy']);
 
 const followLog = ref(true);
 const logElement = ref(null);
+const taskStatus = (task) =>
+  ({
+    waiting: '等待',
+    running: stageLabels[task.stage] || '构建中',
+    success: '成功',
+    failed: '失败',
+    cancelled: '已取消',
+    skipped: '已跳过',
+  })[task.status] || task.status;
 
 watch(
   () => props.run?.id,
@@ -107,6 +116,22 @@ watch(
           <RotateCcw :size="16" />
           使用历史产物发布，跳过依赖安装与构建。
         </div>
+
+        <section v-if="run.buildMode === 'multi'" class="multi-run-details">
+          <h3>{{ run.sourceCount }} 个代码源 · {{ run.taskCount }} 个构建任务</h3>
+          <p v-if="!run.buildDetails">等待执行后显示各仓库提交和任务进度。</p>
+          <ul v-else>
+            <li v-for="source in run.buildDetails.sources" :key="source.id">
+              <strong>{{ source.name }}</strong> · {{ source.branch }} ·
+              <code>{{ source.commitSha?.slice(0, 12) || '等待拉取' }}</code>
+            </li>
+          </ul>
+          <div v-for="task in run.buildDetails?.tasks || []" :key="task.id" class="multi-run-task">
+            <strong>{{ task.name }}</strong
+            ><span>{{ taskStatus(task) }}</span>
+            <small>Node {{ task.nodeVersion || '待识别' }} · 发布到 {{ task.publishDir }}</small>
+          </div>
+        </section>
 
         <section v-if="isCommand(run)" class="command-preview">
           <div>
@@ -200,3 +225,32 @@ watch(
     </section>
   </div>
 </template>
+
+<style scoped>
+.multi-run-details {
+  border: 1px solid var(--border, #e4ebf4);
+  border-radius: 12px;
+  padding: 16px;
+  margin: 20px 0;
+  font-size: 13px;
+}
+.multi-run-details h3 {
+  margin: 0 0 12px;
+  font-size: 14px;
+}
+.multi-run-details ul {
+  padding-left: 18px;
+  line-height: 1.8;
+}
+.multi-run-task {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 6px;
+  padding: 10px 0;
+  border-top: 1px solid var(--border, #e4ebf4);
+}
+.multi-run-task small {
+  grid-column: 1 / -1;
+  color: var(--text-muted, #7a8ca5);
+}
+</style>

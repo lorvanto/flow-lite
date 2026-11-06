@@ -5,6 +5,7 @@ export function secretValues(project, credentials) {
   const items = credentials instanceof Map ? [...credentials.values()] : Object.values(credentials);
   const values = [
     ...Object.values(project.environment || {}),
+    ...(project.tasks || []).flatMap((task) => Object.values(task.environment || {})),
     ...items.flatMap((item) =>
       (item.privateKey || '').split(/\r?\n/).filter((line) => !line.startsWith('-----')),
     ),

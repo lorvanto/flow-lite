@@ -8,6 +8,7 @@ import { validateNodeImagePrefix } from '../config.mjs';
 import { prepareSshAuth } from './ssh-auth.mjs';
 import { prepareGitHttpsAuth } from './git-auth.mjs';
 import { isAllowedHttpGitRepository } from '../../shared/repository-policy.mjs';
+import { validateProject } from '../lib/validation.mjs';
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const VERSION = /^(?:v)?(\d{1,2})(?:\.(\d{1,3}))?(?:\.(\d{1,3}))?$/;
@@ -663,38 +664,19 @@ async function createContext(options) {
   };
 }
 
-export async function executeBuild(options) {
-  const context = await createContext(options);
-  const { project, run, config, tempDir, signal, onLog, onStage, onMetadata, credentials } =
-    context;
-  const sourceDir = path.join(tempDir, 'source');
-  let artifactPath;
-  let archived = false;
+async function checkoutRepository(context, sourceDir) {
+  const { project, run, config, tempDir, signal, onLog, credentials } = context;
+  assertRepository(project.repoUrl, config);
+  const branch = project.branch || 'main';
+  if (
+    !/^[A-Za-z0-9][A-Za-z0-9._/-]*$/.test(branch) ||
+    branch.includes('..') ||
+    branch.includes('//') ||
+    /[/.]$/.test(branch)
+  )
+    throw new Error('Git 分支名称无效');
   let httpsAuth;
   try {
-    assertRepository(project.repoUrl, config);
-    const branch = project.branch || 'main';
-    if (
-      !/^[A-Za-z0-9][A-Za-z0-9._/-]*$/.test(branch) ||
-      branch.includes('..') ||
-      branch.includes('//') ||
-      /[/.]$/.test(branch)
-    )
-      throw new Error('Git 分支名称无效');
-    if (
-      typeof project.installCommand !== 'string' ||
-      !project.installCommand.trim() ||
-      typeof project.buildCommand !== 'string' ||
-      !project.buildCommand.trim()
-    )
-      throw new Error('安装命令和构建命令不能为空');
-    const workdir = relativePath(project.workdir || '.', '工作目录');
-    const artifactDir = relativePath(project.artifactDir || 'dist', '产物目录', {
-      allowDot: false,
-    });
-    const environment = projectEnvironment(project.environment);
-    await onStage('checkout');
-    await onLog(`检出仓库分支：${branch}\n`);
     const credential = lookupCredential(credentials, project.buildCredentialId);
     const approvedHttp = isAllowedHttpGitRepository(project.repoUrl);
     const gitBase = {
@@ -787,6 +769,45 @@ export async function executeBuild(options) {
       signal,
       onOutput: onLog,
     });
+    return commitSha;
+  } finally {
+    if (httpsAuth) await httpsAuth.cleanup().catch(() => {});
+  }
+}
+
+export async function executeBuild(options) {
+  if (options.project.buildMode === 'multi') return executeMultiBuild(options);
+  const context = await createContext(options);
+  const { project, run, config, tempDir, signal, onLog, onStage, onMetadata, credentials } =
+    context;
+  const sourceDir = path.join(tempDir, 'source');
+  let artifactPath;
+  let archived = false;
+  try {
+    assertRepository(project.repoUrl, config);
+    const branch = project.branch || 'main';
+    if (
+      !/^[A-Za-z0-9][A-Za-z0-9._/-]*$/.test(branch) ||
+      branch.includes('..') ||
+      branch.includes('//') ||
+      /[/.]$/.test(branch)
+    )
+      throw new Error('Git 分支名称无效');
+    if (
+      typeof project.installCommand !== 'string' ||
+      !project.installCommand.trim() ||
+      typeof project.buildCommand !== 'string' ||
+      !project.buildCommand.trim()
+    )
+      throw new Error('安装命令和构建命令不能为空');
+    const workdir = relativePath(project.workdir || '.', '工作目录');
+    const artifactDir = relativePath(project.artifactDir || 'dist', '产物目录', {
+      allowDot: false,
+    });
+    const environment = projectEnvironment(project.environment);
+    await onStage('checkout');
+    await onLog(`检出仓库分支：${branch}\n`);
+    const commitSha = await checkoutRepository(context, sourceDir);
     await onMetadata({ commitSha });
     await onLog(`提交：${commitSha}\n`);
     const projectDir = await realDirectoryWithin(sourceDir, workdir, '工作目录');
@@ -827,7 +848,175 @@ export async function executeBuild(options) {
       await fs.rm(artifactPath, { recursive: true, force: true }).catch(() => {});
     throw error;
   } finally {
-    if (httpsAuth) await httpsAuth.cleanup().catch(() => {});
+    await fs.rm(tempDir, { recursive: true, force: true }).catch(() => {});
+  }
+}
+
+async function executeMultiBuild(options) {
+  // Revalidate immutable snapshots as well as API input: credential and output
+  // boundaries must also hold for imported/old database records.
+  const project = { ...validateProject(options.project, options.config), id: options.project.id };
+  const context = await createContext({ ...options, project });
+  const { run, config, tempDir, signal, onLog, onStage, onMetadata } = context;
+  const pinned = run.buildDetails?.sources || [];
+  const details = {
+    sources: project.sources.map(({ id, name, branch }) => ({
+      id,
+      name,
+      branch,
+      status: 'waiting',
+    })),
+    tasks: project.tasks.map(({ id, name, sourceId, publishDir }) => ({
+      id,
+      name,
+      sourceId,
+      publishDir,
+      status: 'waiting',
+      stage: 'waiting',
+    })),
+  };
+  const emit = async () => {
+    await onMetadata({ buildDetails: structuredClone(details) });
+  };
+  const directories = new Map();
+  const combined = path.join(tempDir, 'combined');
+  let activeSource;
+  let activeTask;
+  let artifactPath;
+  let archived = false;
+  try {
+    await emit();
+    await onStage('checkout');
+    for (const source of project.sources) {
+      checkAbort(signal);
+      activeSource = details.sources.find((item) => item.id === source.id);
+      activeSource.status = 'running';
+      await emit();
+      await onLog(`\n[Flow Lite] 代码源：${source.name} / ${source.branch}\n`);
+      const directory = path.join(tempDir, `source-${source.id}`);
+      const authDirectory = path.join(tempDir, `auth-${source.id}`);
+      await fs.mkdir(authDirectory, { mode: 0o700 });
+      let commitSha;
+      try {
+        commitSha = await checkoutRepository(
+          {
+            ...context,
+            project: { ...project, ...source },
+            tempDir: authDirectory,
+            run: { ...run, commitSha: pinned.find((item) => item.id === source.id)?.commitSha },
+          },
+          directory,
+        );
+      } finally {
+        // No repository credential material survives into any build task.
+        await fs.rm(authDirectory, { recursive: true, force: true });
+      }
+      Object.assign(activeSource, { commitSha, status: 'success' });
+      directories.set(source.id, directory);
+      await onLog(`提交：${commitSha}\n`);
+      await emit();
+      activeSource = null;
+    }
+    await onMetadata({ commitSha: details.sources[0].commitSha });
+    await onStage('build');
+    for (const task of project.tasks) {
+      checkAbort(signal);
+      activeTask = details.tasks.find((item) => item.id === task.id);
+      Object.assign(activeTask, { status: 'running', stage: 'install' });
+      await emit();
+      await onLog(`\n[Flow Lite] 构建任务：${task.name} → ${task.publishDir}\n`);
+      const sourceDir = directories.get(task.sourceId);
+      const projectDir = await realDirectoryWithin(sourceDir, task.workdir, '任务工作目录');
+      const pkg = JSON.parse(await readSmallFile(path.join(projectDir, 'package.json')));
+      const nodeVersion = await determineNodeVersion(task, sourceDir, projectDir);
+      const manager = selectPackageManager(task, pkg, nodeVersion);
+      const taskDirectory = path.join(tempDir, `task-${task.id}`);
+      await fs.mkdir(taskDirectory, { mode: 0o700 });
+      const runtimeContext = {
+        ...context,
+        project: { ...project, ...task, id: project.id },
+        sourceDir,
+        projectDir,
+        workdir: relativePath(task.workdir, '任务工作目录'),
+        nodeVersion,
+        manager,
+        tempDir: taskDirectory,
+        environment: projectEnvironment({ ...project.environment, ...task.environment }),
+        onStage: async (stage) => {
+          activeTask.stage = stage;
+          await emit();
+        },
+        onMetadata: async (metadata) => {
+          for (const key of ['nodeVersion', 'packageManagerVersion'])
+            if (metadata[key]) activeTask[key] = metadata[key];
+          await emit();
+        },
+      };
+      await (config.runnerMode === 'host'
+        ? hostBuild(runtimeContext)
+        : dockerBuild(runtimeContext));
+      const verifiedProjectDir = await realDirectoryWithin(sourceDir, task.workdir, '任务工作目录');
+      const output = await realDirectoryWithin(
+        verifiedProjectDir,
+        task.artifactDir,
+        '任务产物目录',
+      );
+      await validateStaticTree(output, signal);
+      const target = path.join(combined, task.publishDir);
+      if (task.publishDir !== '.') await fs.mkdir(path.dirname(target), { recursive: true });
+      await copyStaticTree(output, target, signal);
+      Object.assign(activeTask, { status: 'success', stage: 'done' });
+      await emit();
+      activeTask = null;
+    }
+    if (!(await existingStat(path.join(combined, 'index.html')))) {
+      const escape = (value) =>
+        String(value)
+          .replaceAll('&', '&amp;')
+          .replaceAll('<', '&lt;')
+          .replaceAll('>', '&gt;')
+          .replaceAll('"', '&quot;');
+      const links = project.tasks
+        .map(
+          (task) =>
+            `<li><a href="./${task.publishDir.split('/').map(encodeURIComponent).join('/')}/">${escape(task.name)}</a></li>`,
+        )
+        .join('');
+      await fs.writeFile(
+        path.join(combined, 'index.html'),
+        `<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>${escape(project.name)}</title><h1>${escape(project.name)}</h1><ul>${links}</ul></html>`,
+      );
+    }
+    await onStage('archive');
+    await validateStaticTree(combined, signal);
+    const projectArtifacts = path.join(config.dataDir, 'artifacts', project.id);
+    await fs.mkdir(projectArtifacts, { recursive: true });
+    await plainDirectory(projectArtifacts);
+    artifactPath = path.join(projectArtifacts, run.id);
+    await copyStaticTree(combined, artifactPath, signal);
+    archived = true;
+    await onStage('deploy');
+    const releasePath = await publish(artifactPath, project, run.id, context);
+    return {
+      artifactPath,
+      releasePath,
+      commitSha: details.sources[0].commitSha,
+      nodeVersion: [...new Set(details.tasks.map((task) => task.nodeVersion))].join(' / '),
+      buildDetails: details,
+    };
+  } catch (error) {
+    if (activeSource) activeSource.status = signal.aborted ? 'cancelled' : 'failed';
+    if (activeTask) {
+      activeTask.status = signal.aborted ? 'cancelled' : 'failed';
+      activeTask.stage = activeTask.status;
+    }
+    for (const item of [...details.sources, ...details.tasks])
+      if (item.status === 'waiting') item.status = 'skipped';
+    await emit().catch(() => {});
+    if (artifactPath && !archived)
+      await fs.rm(artifactPath, { recursive: true, force: true }).catch(() => {});
+    throw error;
+  } finally {
     await fs.rm(tempDir, { recursive: true, force: true }).catch(() => {});
   }
 }
