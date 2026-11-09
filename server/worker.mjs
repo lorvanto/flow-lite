@@ -10,7 +10,10 @@ import { executeCommands } from './runners/command.mjs';
 import { createLogWriter, secretValues, redactText } from './lib/logs.mjs';
 import { sameTarget } from './lib/validation.mjs';
 
-export async function runWorker(config, { signal, once = false } = {}) {
+export async function runWorker(
+  config,
+  { signal, once = false, runner: buildRunner = runner } = {},
+) {
   const store = createStore(config);
   const owner = randomUUID();
   let activeController;
@@ -33,8 +36,28 @@ export async function runWorker(config, { signal, once = false } = {}) {
       }
     }, 3000);
     for (const interrupted of store.recoverRuns()) {
-      const run = store.getRun(interrupted.id);
-      if (run?.kind === 'build')
+      let run = store.getRun(interrupted.id);
+      if (
+        run?.buildDetails?.backend &&
+        ['frontend-publish', 'activate', 'rollback', 'done'].includes(
+          run.buildDetails.backend.stage,
+        )
+      ) {
+        store.updateRun(run.id, {
+          buildDetails: {
+            ...run.buildDetails,
+            backend: {
+              ...run.buildDetails.backend,
+              status: 'failed',
+              stage: 'recovery_required',
+              rollbackConfirmed: false,
+            },
+          },
+          error: '统一发布恢复状态未确认，执行器已中断，请核实 API 与前端版本',
+        });
+        run = store.getRun(interrupted.id);
+      }
+      if (run?.kind === 'build' && run.buildDetails?.backend?.stage !== 'recovery_required')
         fs.rmSync(path.join(config.dataDir, 'artifacts', run.projectId, run.id), {
           recursive: true,
           force: true,
@@ -45,7 +68,7 @@ export async function runWorker(config, { signal, once = false } = {}) {
         { mode: 0o600 },
       );
     }
-    let cleaned = !runner.cleanupAbandonedBuilds;
+    let cleaned = !buildRunner.cleanupAbandonedBuilds;
     let cleanupWarningAt = 0;
     let cleanupRetryAt = 0;
     const stop = () => activeController?.abort(new Error('执行器正在关闭'));
@@ -54,7 +77,7 @@ export async function runWorker(config, { signal, once = false } = {}) {
       while (!signal?.aborted && ownsLease) {
         if (!cleaned && Date.now() >= cleanupRetryAt) {
           try {
-            await runner.cleanupAbandonedBuilds({
+            await buildRunner.cleanupAbandonedBuilds({
               config,
               onLog: (text) => console.info(String(text).trim()),
             });
@@ -78,7 +101,13 @@ export async function runWorker(config, { signal, once = false } = {}) {
         activeController = new AbortController();
         const project = run.projectSnapshot;
         const credentials = {};
-        for (const id of [project.buildCredentialId, project.deploy.credentialId].filter(Boolean)) {
+        for (const id of new Set(
+          [
+            project.buildCredentialId,
+            ...(project.sources || []).map((source) => source.buildCredentialId),
+            project.deploy.credentialId,
+          ].filter(Boolean),
+        )) {
           const credential = store.getCredential(id);
           if (credential) credentials[id] = credential;
         }
@@ -121,8 +150,8 @@ export async function runWorker(config, { signal, once = false } = {}) {
           result = await (run.kind === 'command'
             ? executeCommands(args)
             : run.kind === 'rollback'
-              ? runner.executeRollback(args)
-              : runner.executeBuild(args));
+              ? buildRunner.executeRollback(args)
+              : buildRunner.executeBuild(args));
           if (run.kind !== 'command')
             store.transaction(() => {
               const current = store.getProject(project.id);
@@ -141,7 +170,12 @@ export async function runWorker(config, { signal, once = false } = {}) {
               : '\n[Flow Lite] 发布完成，当前网站版本已切换。\n',
           );
         } catch (error) {
-          const reason = activeController.signal.aborted ? activeController.signal.reason : error;
+          const reason =
+            error?.recoveryRequired === true
+              ? error
+              : activeController.signal.aborted
+                ? activeController.signal.reason
+                : error;
           caught = redactText(reason?.message || String(reason), secrets).slice(0, 4000);
           logger.write(`\n[Flow Lite] 执行结束：${caught}\n`);
         } finally {
@@ -175,7 +209,10 @@ export async function runWorker(config, { signal, once = false } = {}) {
             error: caught || '任务执行失败',
             finishedAt: now(),
           });
-          if (run.kind === 'build')
+          if (
+            run.kind === 'build' &&
+            store.getRun(run.id)?.buildDetails?.backend?.stage !== 'recovery_required'
+          )
             fs.rmSync(path.join(config.dataDir, 'artifacts', project.id, run.id), {
               recursive: true,
               force: true,

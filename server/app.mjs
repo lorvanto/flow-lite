@@ -17,10 +17,27 @@ import {
   sameTarget,
 } from './lib/validation.mjs';
 import { projectRoot } from './config.mjs';
+import { isAllowedHttpGitRepository } from '../shared/repository-policy.mjs';
 
 const execFileAsync = promisify(execFile);
 const SESSION_SECONDS = 7 * 24 * 3600;
 export const logPath = (config, id) => path.join(config.dataDir, 'logs', `${id}.log`);
+
+function sameBackendConfiguration(previous, current) {
+  const oldEnabled = previous?.enabled === true;
+  const enabled = current?.enabled === true;
+  if (oldEnabled !== enabled) return false;
+  if (!enabled) return true;
+  const fields = ['enabled', 'type', 'sourceId', 'workdir', 'phpVersion', 'application'];
+  return (
+    [previous, current].every(
+      (value) =>
+        value &&
+        Object.keys(value).length === fields.length &&
+        fields.every((key) => Object.hasOwn(value, key)),
+    ) && fields.every((key) => previous[key] === current[key])
+  );
+}
 
 export function publicRun(run, config) {
   if (!run) return null;
@@ -30,6 +47,13 @@ export function publicRun(run, config) {
     projectName: projectSnapshot.name,
     projectType: projectSnapshot.type || 'node',
     branch: projectSnapshot.branch,
+    ...(projectSnapshot.buildMode === 'multi'
+      ? {
+          buildMode: 'multi',
+          taskCount: projectSnapshot.tasks.length,
+          sourceCount: projectSnapshot.sources.length,
+        }
+      : {}),
     cancelRequested,
     ...(run.kind === 'command'
       ? {
@@ -138,12 +162,16 @@ export async function createApp(config, options = {}) {
     return run;
   }
   function checkCredentials(project) {
-    if (project.buildCredentialId) {
-      const credential = store.getCredential(project.buildCredentialId);
+    for (const source of project.buildMode === 'multi' ? project.sources : [project]) {
+      if (!source.buildCredentialId) continue;
+      const credential = store.getCredential(source.buildCredentialId);
       if (!credential) fail('所选仓库凭据不存在');
-      const https = /^https:\/\//i.test(project.repoUrl || '');
-      if (https && credential.type !== 'git-https') fail('HTTPS 仓库请选择 Git HTTPS 账号密码凭据');
-      if (!https && credential.type !== 'ssh') fail('Git HTTPS 账号密码凭据只能用于 HTTPS 仓库');
+      const https = /^https:\/\//i.test(source.repoUrl || '');
+      const http = isAllowedHttpGitRepository(source.repoUrl);
+      if ((https || http) && credential.type !== 'git-https')
+        fail(`${http ? 'HTTP' : 'HTTPS'} 仓库请选择 Git HTTPS 账号密码凭据`);
+      if (!https && !http && credential.type !== 'ssh')
+        fail('Git HTTPS 账号密码凭据只能用于 HTTPS 或已批准的 HTTP 仓库');
     }
     if (project.deploy.type === 'ssh') {
       const credential = store.getCredential(project.deploy.credentialId);
@@ -329,10 +357,40 @@ export async function createApp(config, options = {}) {
       fail('流水线类型已变更，请按当前配置创建新的运行', 409);
     if (!sameTarget(source.projectSnapshot.deploy, project.deploy))
       fail('网站发布位置已变更，请从项目创建新的运行', 409);
+    if (!sameBackendConfiguration(source.projectSnapshot.backend, project.backend))
+      fail('API 发布配置已变更，请从项目按当前配置新建运行', 409);
+    if (
+      (project.tasks || []).some(
+        (task) =>
+          task.targetVueMajor === 3 &&
+          !source.projectSnapshot.tasks?.some(
+            (previous) => previous.id === task.id && previous.targetVueMajor === 3,
+          ),
+      )
+    )
+      fail('Vue 3 构建目标已变更，请从项目按当前配置新建运行', 409);
     checkCredentials(source.projectSnapshot);
     if (source.kind === 'rollback') fail('请从发布记录重新选择回滚版本', 400);
     let run = store.enqueue(source.projectSnapshot);
-    if (source.commitSha) run = store.updateRun(run.id, { commitSha: source.commitSha });
+    if (source.commitSha || source.buildDetails)
+      run = store.updateRun(run.id, {
+        ...(source.commitSha ? { commitSha: source.commitSha } : {}),
+        ...(source.buildDetails
+          ? {
+              buildDetails: {
+                sources: source.buildDetails.sources.map((item) => ({
+                  ...item,
+                  status: 'waiting',
+                })),
+                tasks: source.buildDetails.tasks.map((item) => ({
+                  ...item,
+                  status: 'waiting',
+                  stage: 'waiting',
+                })),
+              },
+            }
+          : {}),
+      });
     reply.code(202);
     return { run: publicRun(run, config) };
   });
@@ -352,7 +410,14 @@ export async function createApp(config, options = {}) {
       fail('网站发布位置已变更，此版本不能回滚到当前目标');
     checkCredentials(project);
     reply.code(202);
-    return { run: publicRun(store.enqueue(project, 'rollback', source.id), config) };
+    const run = store.enqueue(project, 'rollback', source.id);
+    store.updateRun(run.id, {
+      commitSha: source.commitSha,
+      nodeVersion: source.nodeVersion,
+      packageManagerVersion: source.packageManagerVersion,
+      buildDetails: source.buildDetails,
+    });
+    return { run: publicRun(store.getRun(run.id), config) };
   });
 
   const credentialOutput = (credential) => ({
@@ -374,7 +439,9 @@ export async function createApp(config, options = {}) {
     const id = request.params.id;
     if (!isUuid(id) || !store.getCredential(id)) fail('凭据不存在', 404);
     const uses = (project) =>
-      project.buildCredentialId === id || project.deploy.credentialId === id;
+      project.buildCredentialId === id ||
+      (project.sources || []).some((source) => source.buildCredentialId === id) ||
+      project.deploy.credentialId === id;
     if (
       store.listProjects().some(uses) ||
       store.listRuns(null, 100000).some((run) => !terminal(run.status) && uses(run.projectSnapshot))

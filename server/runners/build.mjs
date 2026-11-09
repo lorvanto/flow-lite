@@ -7,11 +7,80 @@ import { runProcess, checkAbort } from '../lib/process.mjs';
 import { validateNodeImagePrefix } from '../config.mjs';
 import { prepareSshAuth } from './ssh-auth.mjs';
 import { prepareGitHttpsAuth } from './git-auth.mjs';
+import { isAllowedHttpGitRepository } from '../../shared/repository-policy.mjs';
+import { validateProject } from '../lib/validation.mjs';
+import {
+  backendEnabled,
+  capturePhpBackendSource,
+  preparePhpBackend,
+  activatePhpBackend,
+  rollbackPhpBackend,
+  statusPhpBackend,
+  loadPhpBackendHandle,
+} from './php-backend.mjs';
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const VERSION = /^(?:v)?(\d{1,2})(?:\.(\d{1,3}))?(?:\.(\d{1,3}))?$/;
 const MANAGER_VERSION = /^\d{1,3}(?:\.\d{1,3}){0,2}(?:-[\da-z.-]+)?$/i;
 const shellQuote = (value) => `'${String(value).replaceAll("'", "'\\''")}'`;
+const BUILD_TOOLS = fileURLToPath(new URL('../../build-tools', import.meta.url));
+const GIT_WORKTREE_PROJECTS = path.join(BUILD_TOOLS, 'git-worktree-projects.json');
+
+export async function trustedBuildToolsMount() {
+  try {
+    await fs.lstat(BUILD_TOOLS);
+  } catch (error) {
+    if (error.code === 'ENOENT') return [];
+    throw error;
+  }
+  const check = (state, directory) => {
+    if (
+      state.uid !== 0 ||
+      state.mode & 0o022 ||
+      state.isSymbolicLink() ||
+      (directory ? !state.isDirectory() : !state.isFile() || state.nlink !== 1)
+    )
+      throw new Error('构建工具必须是 root 所有且构建用户不可写的普通目录或文件');
+  };
+  // The application directory must also prevent replacing the trusted root.
+  let ancestor = path.parse(BUILD_TOOLS).root;
+  check(await fs.lstat(ancestor), true);
+  for (const part of BUILD_TOOLS.slice(ancestor.length).split(path.sep)) {
+    ancestor = path.join(ancestor, part);
+    check(await fs.lstat(ancestor), true);
+  }
+  const scan = async (directory) => {
+    for (const name of await fs.readdir(directory)) {
+      const filename = path.join(directory, name);
+      const state = await fs.lstat(filename);
+      check(state, state.isDirectory());
+      if (state.isDirectory()) await scan(filename);
+    }
+  };
+  await scan(BUILD_TOOLS);
+  if (/[\0,\r\n]/.test(BUILD_TOOLS)) throw new Error('固定构建工具目录不支持该路径');
+  return ['--mount', `type=bind,src=${BUILD_TOOLS},dst=/flow-tools,readonly`];
+}
+
+async function gitWorktreeEnabled(application) {
+  let stat;
+  try {
+    stat = await fs.lstat(GIT_WORKTREE_PROJECTS);
+  } catch (error) {
+    if (error.code === 'ENOENT') return false;
+    throw error;
+  }
+  await trustedBuildToolsMount();
+  if (!stat.isFile() || stat.size > 4096) throw new Error('Git 工作目录项目清单格式不正确');
+  const applications = JSON.parse(await fs.readFile(GIT_WORKTREE_PROJECTS, 'utf8'));
+  if (
+    !Array.isArray(applications) ||
+    applications.some((entry) => typeof entry !== 'string' || !/^[a-z][a-z0-9-]*$/.test(entry)) ||
+    new Set(applications).size !== applications.length
+  )
+    throw new Error('Git 工作目录项目清单格式不正确');
+  return applications.includes(application);
+}
 
 function assertId(value, label) {
   if (!UUID.test(value || '')) throw new Error(`${label}不是有效的 UUID`);
@@ -99,6 +168,11 @@ function assertRepository(repoUrl, config) {
     const url = new URL(repoUrl);
     if (url.username || url.password)
       throw new Error('请通过凭据配置账号、密码或令牌，不要写入 Git 仓库地址');
+    return;
+  }
+  if (/^http:\/\//i.test(repoUrl)) {
+    if (!isAllowedHttpGitRepository(repoUrl))
+      throw new Error('HTTP 仅支持已批准的 git.yin-duo.com/mini-program 仓库地址');
     return;
   }
   if (/^ssh:\/\//i.test(repoUrl)) {
@@ -389,28 +463,36 @@ async function deployRemote(artifactPath, target, releaseId, context) {
     throw new Error('SSH 主机、用户名或端口配置无效');
   }
   const credential = getCredential(credentials, target.credentialId);
-  const auth = await prepareSshAuth({
-    credential,
-    tempDir,
-    prefix: 'deploy',
-    env: baseEnvironment(),
-  });
-  const archive = path.join(tempDir, 'artifact.tar');
-  await runProcess('tar', ['-cf', archive, '-C', artifactPath, '.'], {
-    env: baseEnvironment(),
-    signal,
-    onOutput: onLog,
-  });
-  const remoteCommand = `sh -c ${shellQuote(REMOTE_DEPLOY)} -- ${shellQuote(root)} ${shellQuote(releaseId)} ${shellQuote(randomUUID())}`;
-  const destination = `${user}@${host}`;
-  await onLog(`通过 SSH 发布到 ${destination}:${root}\n`);
-  await runProcess('ssh', [...auth.args, '-p', String(port), '--', destination, remoteCommand], {
-    env: auth.env,
-    signal,
-    onOutput: onLog,
-    input: createReadStream(archive),
-  });
-  return `${root}/releases/${releaseId}`;
+  // A failed publication can be followed by a recovery publication in this same
+  // context. Give each attempt its own wx-auth files and streaming archive.
+  const authDir = await fs.mkdtemp(path.join(tempDir, 'deploy-'));
+  await fs.chmod(authDir, 0o700);
+  try {
+    const auth = await prepareSshAuth({
+      credential,
+      tempDir: authDir,
+      prefix: 'deploy',
+      env: baseEnvironment(),
+    });
+    const archive = path.join(authDir, 'artifact.tar');
+    await runProcess('tar', ['-cf', archive, '-C', artifactPath, '.'], {
+      env: baseEnvironment(),
+      signal,
+      onOutput: onLog,
+    });
+    const remoteCommand = `sh -c ${shellQuote(REMOTE_DEPLOY)} -- ${shellQuote(root)} ${shellQuote(releaseId)} ${shellQuote(randomUUID())}`;
+    const destination = `${user}@${host}`;
+    await onLog(`通过 SSH 发布到 ${destination}:${root}\n`);
+    await runProcess('ssh', [...auth.args, '-p', String(port), '--', destination, remoteCommand], {
+      env: auth.env,
+      signal,
+      onOutput: onLog,
+      input: createReadStream(archive),
+    });
+    return `${root}/releases/${releaseId}`;
+  } finally {
+    await fs.rm(authDir, { recursive: true, force: true });
+  }
 }
 
 async function publish(artifactPath, project, releaseId, context) {
@@ -449,6 +531,7 @@ async function dockerBuild(context) {
     Number(cpus) <= 0
   )
     throw new Error('Docker CPU 或内存限制配置无效');
+  const buildToolsMount = await trustedBuildToolsMount();
   const uid = process.getuid?.() || 1000;
   const gid = process.getgid?.() || 1000;
   const cacheDir = path.join(config.dataDir, 'cache', project.id, `node-${nodeVersion}`);
@@ -523,6 +606,7 @@ async function dockerBuild(context) {
         `type=bind,src=${sourceDir},dst=/workspace`,
         '--mount',
         `type=bind,src=${cacheDir},dst=/npm-cache`,
+        ...buildToolsMount,
         '--workdir',
         path.posix.join('/workspace', workdir),
         '--env-file',
@@ -657,50 +741,37 @@ async function createContext(options) {
   };
 }
 
-export async function executeBuild(options) {
-  const context = await createContext(options);
-  const { project, run, config, tempDir, signal, onLog, onStage, onMetadata, credentials } =
-    context;
-  const sourceDir = path.join(tempDir, 'source');
-  let artifactPath;
-  let archived = false;
+async function checkoutRepository(context, sourceDir, { fullHistory = false } = {}) {
+  const { project, run, config, tempDir, signal, onLog, credentials } = context;
+  assertRepository(project.repoUrl, config);
+  const branch = project.branch || 'main';
+  if (
+    !/^[A-Za-z0-9][A-Za-z0-9._/-]*$/.test(branch) ||
+    branch.includes('..') ||
+    branch.includes('//') ||
+    /[/.]$/.test(branch)
+  )
+    throw new Error('Git 分支名称无效');
   let httpsAuth;
   try {
-    assertRepository(project.repoUrl, config);
-    const branch = project.branch || 'main';
-    if (
-      !/^[A-Za-z0-9][A-Za-z0-9._/-]*$/.test(branch) ||
-      branch.includes('..') ||
-      branch.includes('//') ||
-      /[/.]$/.test(branch)
-    )
-      throw new Error('Git 分支名称无效');
-    if (
-      typeof project.installCommand !== 'string' ||
-      !project.installCommand.trim() ||
-      typeof project.buildCommand !== 'string' ||
-      !project.buildCommand.trim()
-    )
-      throw new Error('安装命令和构建命令不能为空');
-    const workdir = relativePath(project.workdir || '.', '工作目录');
-    const artifactDir = relativePath(project.artifactDir || 'dist', '产物目录', {
-      allowDot: false,
-    });
-    const environment = projectEnvironment(project.environment);
-    await onStage('checkout');
-    await onLog(`检出仓库分支：${branch}\n`);
     const credential = lookupCredential(credentials, project.buildCredentialId);
+    const approvedHttp = isAllowedHttpGitRepository(project.repoUrl);
     const gitBase = {
       ...baseEnvironment(),
       GIT_TERMINAL_PROMPT: '0',
       GIT_CONFIG_GLOBAL: '/dev/null',
       GIT_CONFIG_NOSYSTEM: '1',
-      GIT_ALLOW_PROTOCOL: config.allowLocalRepositories ? 'https:ssh:file' : 'https:ssh',
+      GIT_ALLOW_PROTOCOL: approvedHttp
+        ? 'http'
+        : config.allowLocalRepositories
+          ? 'https:ssh:file'
+          : 'https:ssh',
     };
     let gitEnv;
-    if (/^https:\/\//i.test(project.repoUrl)) {
+    if (/^https:\/\//i.test(project.repoUrl) || approvedHttp) {
+      if (approvedHttp && !credential) throw new Error('该 HTTP 仓库需要选择 Git 账号密码凭据');
       if (credential && credential.type !== 'git-https')
-        throw new Error('HTTPS 仓库需要 Git HTTPS 账号密码或令牌凭据');
+        throw new Error(`${approvedHttp ? 'HTTP' : 'HTTPS'} 仓库需要 Git HTTPS 账号密码或令牌凭据`);
       if (credential) {
         await requireGitHttpsIsolation(gitBase, signal);
         httpsAuth = await prepareGitHttpsAuth({
@@ -722,14 +793,14 @@ export async function executeBuild(options) {
       });
       gitEnv = { ...auth.env, GIT_SSH_COMMAND: ['ssh', ...auth.args].map(shellQuote).join(' ') };
     }
+    const historyArgs = fullHistory ? ['--no-tags'] : ['--depth', '1'];
     await runProcess(
       'git',
       [
         'clone',
         '--no-local',
         '--no-checkout',
-        '--depth',
-        '1',
+        ...historyArgs,
         '--single-branch',
         '--branch',
         branch,
@@ -749,7 +820,7 @@ export async function executeBuild(options) {
         });
       } catch (error) {
         checkAbort(signal);
-        await runProcess('git', ['fetch', '--depth', '1', 'origin', run.commitSha], {
+        await runProcess('git', ['fetch', ...historyArgs, 'origin', run.commitSha], {
           cwd: sourceDir,
           env: gitEnv,
           signal,
@@ -775,6 +846,45 @@ export async function executeBuild(options) {
       signal,
       onOutput: onLog,
     });
+    return commitSha;
+  } finally {
+    if (httpsAuth) await httpsAuth.cleanup().catch(() => {});
+  }
+}
+
+export async function executeBuild(options) {
+  if (options.project.buildMode === 'multi') return executeMultiBuild(options);
+  const context = await createContext(options);
+  const { project, run, config, tempDir, signal, onLog, onStage, onMetadata, credentials } =
+    context;
+  const sourceDir = path.join(tempDir, 'source');
+  let artifactPath;
+  let archived = false;
+  try {
+    assertRepository(project.repoUrl, config);
+    const branch = project.branch || 'main';
+    if (
+      !/^[A-Za-z0-9][A-Za-z0-9._/-]*$/.test(branch) ||
+      branch.includes('..') ||
+      branch.includes('//') ||
+      /[/.]$/.test(branch)
+    )
+      throw new Error('Git 分支名称无效');
+    if (
+      typeof project.installCommand !== 'string' ||
+      !project.installCommand.trim() ||
+      typeof project.buildCommand !== 'string' ||
+      !project.buildCommand.trim()
+    )
+      throw new Error('安装命令和构建命令不能为空');
+    const workdir = relativePath(project.workdir || '.', '工作目录');
+    const artifactDir = relativePath(project.artifactDir || 'dist', '产物目录', {
+      allowDot: false,
+    });
+    const environment = projectEnvironment(project.environment);
+    await onStage('checkout');
+    await onLog(`检出仓库分支：${branch}\n`);
+    const commitSha = await checkoutRepository(context, sourceDir);
     await onMetadata({ commitSha });
     await onLog(`提交：${commitSha}\n`);
     const projectDir = await realDirectoryWithin(sourceDir, workdir, '工作目录');
@@ -815,7 +925,511 @@ export async function executeBuild(options) {
       await fs.rm(artifactPath, { recursive: true, force: true }).catch(() => {});
     throw error;
   } finally {
-    if (httpsAuth) await httpsAuth.cleanup().catch(() => {});
+    await fs.rm(tempDir, { recursive: true, force: true }).catch(() => {});
+  }
+}
+
+function vue3Range(value) {
+  return (
+    typeof value === 'string' &&
+    /^(?:npm:@vue\/compat@)?[~^]?3(?:\.(?:\d+|x|\*)){0,2}(?:-[\w.-]+)?$/.test(value)
+  );
+}
+
+/** All selected declarations are checked together, before the first npm process. */
+export async function preflightVue3Tasks(project, directories, signal) {
+  const selected = project.tasks.filter(
+    (task) => backendEnabled(project) || task.targetVueMajor === 3,
+  );
+  if (backendEnabled(project)) {
+    const expected = project.backend.application.startsWith('yshop')
+      ? ['h5', 'pc', 'static/admin']
+      : ['h5', 'admin'];
+    if (
+      selected.length !== expected.length ||
+      new Set(selected.map((task) => task.publishDir)).size !== expected.length ||
+      expected.some((part) => !selected.some((task) => task.publishDir === part))
+    )
+      throw new Error('统一 PHP 发布必须包含此业务的全部独立前端目录');
+  }
+  for (const task of selected) {
+    checkAbort(signal);
+    const root = directories.get(task.sourceId);
+    if (!root) throw new Error('Vue3 任务代码源缺失');
+    const directory = await realDirectoryWithin(root, task.workdir, 'Vue3 任务目录');
+    const pkg = JSON.parse(await readSmallFile(path.join(directory, 'package.json')));
+    const groups = [pkg.dependencies, pkg.devDependencies, pkg.peerDependencies].filter(Boolean);
+    const declarations = groups.flatMap((group) =>
+      ['vue', '@vue/compat'].filter((key) => Object.hasOwn(group, key)).map((key) => group[key]),
+    );
+    if (
+      !declarations.length ||
+      declarations.some((value) => !vue3Range(value)) ||
+      groups.some((group) => Object.hasOwn(group, 'vue-template-compiler'))
+    )
+      throw new Error('Vue3 声明检查失败，尚未执行任何依赖安装或发布');
+    const compilers = groups
+      .filter((group) => Object.hasOwn(group, '@vue/compiler-sfc'))
+      .map((group) => group['@vue/compiler-sfc']);
+    if (compilers.some((value) => !vue3Range(value))) throw new Error('Vue3 编译器声明不兼容');
+  }
+}
+
+async function installedPackageWithin(sourceDir, projectDir, name) {
+  const realSource = await fs.realpath(sourceDir);
+  let directory = projectDir;
+  while (directory === sourceDir || directory.startsWith(`${sourceDir}${path.sep}`)) {
+    const filename = path.join(directory, 'node_modules', name, 'package.json');
+    if (await existingStat(filename)) {
+      const real = await fs.realpath(filename);
+      if (!real.startsWith(`${realSource}${path.sep}`))
+        throw new Error('Vue3 依赖解析越出当前代码源');
+      return JSON.parse(await readSmallFile(real));
+    }
+    if (directory === sourceDir) break;
+    directory = path.dirname(directory);
+  }
+  throw new Error('Vue3 构建后缺少真实依赖元数据');
+}
+
+export async function verifyInstalledVue3(sourceDir, projectDir, signal) {
+  checkAbort(signal);
+  const vue = await installedPackageWithin(sourceDir, projectDir, 'vue');
+  const compiler = await installedPackageWithin(sourceDir, projectDir, '@vue/compiler-sfc');
+  if (
+    !['vue', '@vue/compat'].includes(vue.name) ||
+    !/^3\.\d+\.\d+(?:[-+].*)?$/.test(vue.version || '') ||
+    compiler.name !== '@vue/compiler-sfc' ||
+    !/^3\.\d+\.\d+(?:[-+].*)?$/.test(compiler.version || '')
+  )
+    throw new Error('构建实际使用的 Vue 或模板编译器不是 Vue3，已拒绝发布');
+}
+
+export function unifiedReleaseProof(handle) {
+  return {
+    schemaVersion: 1,
+    kind: 'flow-unified-release',
+    application: handle.application,
+    release: handle.release,
+    sourceCommit: handle.sourceCommit,
+    apiTreeSha256: handle.apiTreeSha256,
+    archiveSha256: handle.archiveSha256,
+    frontendRelease: handle.release,
+  };
+}
+
+async function assertUnifiedProof(artifactPath, handle) {
+  const filename = path.join(artifactPath, '.flow-unified-proof.json');
+  const stat = await fs.lstat(filename);
+  if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1 || stat.size > 16384)
+    throw new Error('统一发布来源证明无效');
+  const value = JSON.parse(await fs.readFile(filename, 'utf8'));
+  const expected = unifiedReleaseProof(handle);
+  if (
+    Object.keys(value).sort().join() !== Object.keys(expected).sort().join() ||
+    Object.entries(expected).some(([key, item]) => value[key] !== item)
+  )
+    throw new Error('前端与 API 必须来自同一业务、提交及运行版本');
+}
+
+export async function frontendBaseline(context, releaseId) {
+  assertId(releaseId, '统一发布的现有前端版本');
+  if (releaseId === context.run.id) throw new Error('统一发布基线不能是本次新版本');
+  const artifactPath = path.join(
+    context.config.dataDir,
+    'artifacts',
+    context.project.id,
+    releaseId,
+  );
+  await plainDirectory(path.dirname(artifactPath));
+  await validateStaticTree(artifactPath, context.signal);
+  return { releaseId, artifactPath };
+}
+
+function recoveryContext(context) {
+  // Cancellation/timeout must not prevent restoring an already-started release.
+  return { ...context, signal: AbortSignal.timeout(120000) };
+}
+
+function unifiedFailure(uncertain) {
+  const error = new Error(
+    uncertain
+      ? '统一发布恢复状态未确认，已保留现场，请核实 API 与前端版本'
+      : '统一发布失败，API 和前端已恢复先前版本',
+  );
+  error.code = uncertain ? 'unified_recovery_uncertain' : 'unified_release_restored';
+  error.recoveryRequired = uncertain;
+  if (!uncertain) error.rollbackConfirmed = true;
+  return error;
+}
+
+const backendOperations = {
+  activate: activatePhpBackend,
+  rollback: rollbackPhpBackend,
+  status: statusPhpBackend,
+  publish,
+};
+
+/** Testable orchestration; production callers use the fixed defaults. */
+export async function publishUnifiedRelease(
+  context,
+  { handle, artifactPath, previousFrontend, onBackend = async () => {} },
+  operations = backendOperations,
+) {
+  operations = { ...backendOperations, ...operations };
+  if (!previousFrontend || !UUID.test(previousFrontend.releaseId))
+    throw new Error('统一发布缺少可恢复的前端基线');
+  await assertUnifiedProof(artifactPath, handle);
+  const before = await operations.status(context, handle);
+  if (
+    before.currentManagedRelease !== null &&
+    before.currentManagedRelease !== previousFrontend.releaseId
+  )
+    throw new Error('API 当前版本与队列保存的前端基线不同，已拒绝发布');
+  try {
+    await onBackend({ status: 'running', stage: 'frontend-publish' });
+    const releasePath = await operations.publish(
+      artifactPath,
+      context.project,
+      handle.release,
+      context,
+    );
+    await onBackend({ stage: 'activate' });
+    await context.onStage?.('backend-activate');
+    await operations.activate(context, handle);
+    await onBackend({ status: 'success', stage: 'done' });
+    return releasePath;
+  } catch {
+    const recovery = recoveryContext(context);
+    let confirmed = false;
+    try {
+      const observed = await operations.status(recovery, handle);
+      if (
+        ![null, handle.release, previousFrontend.releaseId].includes(observed.currentManagedRelease)
+      )
+        throw new Error('current changed');
+      const result = await operations.rollback(recovery, handle);
+      if (result.rollbackConfirmed !== true) throw new Error('API restoration unconfirmed');
+      await operations.publish(
+        previousFrontend.artifactPath,
+        context.project,
+        previousFrontend.releaseId,
+        recovery,
+      );
+      confirmed = true;
+    } catch {}
+    await onBackend({
+      status: 'failed',
+      stage: confirmed ? 'rolled_back' : 'recovery_required',
+      rollbackConfirmed: confirmed,
+    }).catch(() => {});
+    throw unifiedFailure(!confirmed);
+  }
+}
+
+export async function rollbackUnifiedRelease(
+  context,
+  { handle, artifactPath, previousFrontend, onBackend = async () => {} },
+  operations = backendOperations,
+) {
+  operations = { ...backendOperations, ...operations };
+  await assertUnifiedProof(artifactPath, handle);
+  if (!previousFrontend || !UUID.test(previousFrontend.releaseId))
+    throw new Error('历史统一回滚缺少当前前端基线');
+  const state = await operations.status(context, handle);
+  if (state.currentManagedRelease !== previousFrontend.releaseId)
+    throw new Error('历史回滚仅支持已登记且与当前前端一致的 API 版本');
+  let frontendAttempted = false;
+  let apiAttempted = false;
+  try {
+    await onBackend({ status: 'running', stage: 'frontend-publish' });
+    frontendAttempted = true;
+    const releasePath = await operations.publish(
+      artifactPath,
+      context.project,
+      handle.release,
+      context,
+    );
+    await onBackend({ stage: 'rollback' });
+    apiAttempted = true;
+    const changed = await operations.rollback(context, handle, {
+      expectedCurrentRelease: state.currentManagedRelease,
+    });
+    if (changed.rollbackConfirmed !== true) throw new Error('历史 API 回滚结果未确认');
+    await onBackend({ status: 'success', stage: 'done' });
+    return releasePath;
+  } catch (error) {
+    let restored = false;
+    let apiUnchanged = error.rollbackConfirmed === true;
+    const recovery = recoveryContext(context);
+    if (!apiAttempted) {
+      try {
+        apiUnchanged =
+          (await operations.status(recovery, handle)).currentManagedRelease ===
+          previousFrontend.releaseId;
+      } catch {}
+    }
+    if (frontendAttempted && apiUnchanged) {
+      try {
+        await operations.publish(
+          previousFrontend.artifactPath,
+          context.project,
+          previousFrontend.releaseId,
+          recovery,
+        );
+        restored = true;
+      } catch {}
+    }
+    await onBackend({
+      status: 'failed',
+      stage: restored ? 'rolled_back' : 'recovery_required',
+      rollbackConfirmed: restored,
+    }).catch(() => {});
+    throw unifiedFailure(!restored);
+  }
+}
+
+async function executeMultiBuild(options) {
+  // Revalidate immutable snapshots as well as API input: credential and output
+  // boundaries must also hold for imported/old database records.
+  const project = { ...validateProject(options.project, options.config), id: options.project.id };
+  const context = await createContext({ ...options, project });
+  const { run, config, tempDir, signal, onLog, onStage, onMetadata } = context;
+  const pinned = run.buildDetails?.sources || [];
+  const details = {
+    sources: project.sources.map(({ id, name, branch }) => ({
+      id,
+      name,
+      branch,
+      status: 'waiting',
+    })),
+    tasks: project.tasks.map(({ id, name, sourceId, publishDir }) => ({
+      id,
+      name,
+      sourceId,
+      publishDir,
+      status: 'waiting',
+      stage: 'waiting',
+    })),
+    ...(backendEnabled(project)
+      ? {
+          backend: {
+            application: project.backend.application,
+            sourceId: project.backend.sourceId,
+            phpVersion: '8.5',
+            status: 'waiting',
+            stage: 'waiting',
+          },
+        }
+      : {}),
+  };
+  const emit = async () => {
+    await onMetadata({ buildDetails: structuredClone(details) });
+  };
+  const directories = new Map();
+  const combined = path.join(tempDir, 'combined');
+  let activeSource;
+  let activeTask;
+  let artifactPath;
+  let archived = false;
+  let backendHandle;
+  let backendSnapshot;
+  let previousFrontend;
+  try {
+    await emit();
+    const gitWorktree =
+      backendEnabled(project) && (await gitWorktreeEnabled(project.backend.application));
+    if (backendEnabled(project))
+      previousFrontend = await frontendBaseline(context, options.project.currentReleaseId);
+    await onStage('checkout');
+    for (const source of project.sources) {
+      checkAbort(signal);
+      activeSource = details.sources.find((item) => item.id === source.id);
+      activeSource.status = 'running';
+      await emit();
+      await onLog(`\n[Flow Lite] 代码源：${source.name} / ${source.branch}\n`);
+      const directory = path.join(tempDir, `source-${source.id}`);
+      const authDirectory = path.join(tempDir, `auth-${source.id}`);
+      await fs.mkdir(authDirectory, { mode: 0o700 });
+      let commitSha;
+      try {
+        commitSha = await checkoutRepository(
+          {
+            ...context,
+            project: { ...project, ...source },
+            tempDir: authDirectory,
+            run: { ...run, commitSha: pinned.find((item) => item.id === source.id)?.commitSha },
+          },
+          directory,
+          { fullHistory: gitWorktree && source.id === project.backend.sourceId },
+        );
+      } finally {
+        // No repository credential material survives into any build task.
+        await fs.rm(authDirectory, { recursive: true, force: true });
+      }
+      Object.assign(activeSource, { commitSha, status: 'success' });
+      directories.set(source.id, directory);
+      await onLog(`提交：${commitSha}\n`);
+      await emit();
+      activeSource = null;
+    }
+    await onMetadata({ commitSha: details.sources[0].commitSha });
+    // Inspect every selected Vue3 declaration before ANY task can install or run scripts.
+    await preflightVue3Tasks(project, directories, signal);
+    if (backendEnabled(project)) {
+      const sourceId = project.backend.sourceId;
+      backendSnapshot = await capturePhpBackendSource(context, {
+        sourceDir: directories.get(sourceId),
+        sourceCommit: details.sources.find((source) => source.id === sourceId).commitSha,
+        gitWorktree,
+      });
+    }
+    await onStage('build');
+    for (const task of project.tasks) {
+      checkAbort(signal);
+      activeTask = details.tasks.find((item) => item.id === task.id);
+      Object.assign(activeTask, { status: 'running', stage: 'install' });
+      await emit();
+      await onLog(`\n[Flow Lite] 构建任务：${task.name} → ${task.publishDir}\n`);
+      const sourceDir = directories.get(task.sourceId);
+      const projectDir = await realDirectoryWithin(sourceDir, task.workdir, '任务工作目录');
+      const pkg = JSON.parse(await readSmallFile(path.join(projectDir, 'package.json')));
+      const nodeVersion = await determineNodeVersion(task, sourceDir, projectDir);
+      const manager = selectPackageManager(task, pkg, nodeVersion);
+      const taskDirectory = path.join(tempDir, `task-${task.id}`);
+      await fs.mkdir(taskDirectory, { mode: 0o700 });
+      const runtimeContext = {
+        ...context,
+        project: { ...project, ...task, id: project.id },
+        sourceDir,
+        projectDir,
+        workdir: relativePath(task.workdir, '任务工作目录'),
+        nodeVersion,
+        manager,
+        tempDir: taskDirectory,
+        environment: projectEnvironment({ ...project.environment, ...task.environment }),
+        onStage: async (stage) => {
+          activeTask.stage = stage;
+          await emit();
+        },
+        onMetadata: async (metadata) => {
+          for (const key of ['nodeVersion', 'packageManagerVersion'])
+            if (metadata[key]) activeTask[key] = metadata[key];
+          await emit();
+        },
+      };
+      await (config.runnerMode === 'host'
+        ? hostBuild(runtimeContext)
+        : dockerBuild(runtimeContext));
+      if (backendEnabled(project) || task.targetVueMajor === 3)
+        await verifyInstalledVue3(sourceDir, projectDir, signal);
+      const verifiedProjectDir = await realDirectoryWithin(sourceDir, task.workdir, '任务工作目录');
+      const output = await realDirectoryWithin(
+        verifiedProjectDir,
+        task.artifactDir,
+        '任务产物目录',
+      );
+      await validateStaticTree(output, signal);
+      const target = path.join(combined, task.publishDir);
+      if (task.publishDir !== '.') await fs.mkdir(path.dirname(target), { recursive: true });
+      await copyStaticTree(output, target, signal);
+      Object.assign(activeTask, { status: 'success', stage: 'done' });
+      await emit();
+      activeTask = null;
+    }
+    if (!(await existingStat(path.join(combined, 'index.html')))) {
+      const escape = (value) =>
+        String(value)
+          .replaceAll('&', '&amp;')
+          .replaceAll('<', '&lt;')
+          .replaceAll('>', '&gt;')
+          .replaceAll('"', '&quot;');
+      const links = project.tasks
+        .map(
+          (task) =>
+            `<li><a href="./${task.publishDir.split('/').map(encodeURIComponent).join('/')}/">${escape(task.name)}</a></li>`,
+        )
+        .join('');
+      await fs.writeFile(
+        path.join(combined, 'index.html'),
+        `<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>${escape(project.name)}</title><h1>${escape(project.name)}</h1><ul>${links}</ul></html>`,
+      );
+    }
+    if (backendEnabled(project)) {
+      Object.assign(details.backend, { status: 'running', stage: 'prepare' });
+      await emit();
+      await onStage('backend-prepare');
+      const sourceId = project.backend.sourceId;
+      backendHandle = await preparePhpBackend(context, {
+        sourceDir: directories.get(sourceId),
+        sourceCommit: details.sources.find((source) => source.id === sourceId).commitSha,
+        snapshot: backendSnapshot,
+      });
+      Object.assign(details.backend, {
+        stage: 'prepared',
+        sourceCommit: backendHandle.sourceCommit,
+        apiTreeSha256: backendHandle.apiTreeSha256,
+        archiveSha256: backendHandle.archiveSha256,
+        phpVersion: backendHandle.phpVersion,
+      });
+      await emit();
+      const proofPath = path.join(combined, '.flow-unified-proof.json');
+      if (await existingStat(proofPath)) throw new Error('统一发布证明路径已被构建产物占用');
+      await fs.writeFile(proofPath, JSON.stringify(unifiedReleaseProof(backendHandle)), {
+        flag: 'wx',
+        mode: 0o644,
+      });
+    }
+    await onStage('archive');
+    await validateStaticTree(combined, signal);
+    const projectArtifacts = path.join(config.dataDir, 'artifacts', project.id);
+    await fs.mkdir(projectArtifacts, { recursive: true });
+    await plainDirectory(projectArtifacts);
+    artifactPath = path.join(projectArtifacts, run.id);
+    await copyStaticTree(combined, artifactPath, signal);
+    archived = true;
+    await onStage('deploy');
+    const releasePath = backendHandle
+      ? await publishUnifiedRelease(context, {
+          handle: backendHandle,
+          artifactPath,
+          previousFrontend,
+          onBackend: async (value) => {
+            Object.assign(details.backend, value);
+            await emit();
+          },
+        })
+      : await publish(artifactPath, project, run.id, context);
+    return {
+      artifactPath,
+      releasePath,
+      commitSha: details.sources[0].commitSha,
+      nodeVersion: [...new Set(details.tasks.map((task) => task.nodeVersion))].join(' / '),
+      buildDetails: details,
+    };
+  } catch (error) {
+    if (activeSource) activeSource.status = signal.aborted ? 'cancelled' : 'failed';
+    if (activeTask) {
+      activeTask.status = signal.aborted ? 'cancelled' : 'failed';
+      activeTask.stage = activeTask.status;
+    }
+    if (details.backend && details.backend.status !== 'success') {
+      if (details.backend.status === 'waiting') details.backend.status = 'skipped';
+      else if (
+        details.backend.stage !== 'rolled_back' &&
+        details.backend.stage !== 'recovery_required'
+      ) {
+        details.backend.status = signal.aborted ? 'cancelled' : 'failed';
+        details.backend.stage = details.backend.status;
+      }
+    }
+    for (const item of [...details.sources, ...details.tasks])
+      if (item.status === 'waiting') item.status = 'skipped';
+    await emit().catch(() => {});
+    if (artifactPath && !archived)
+      await fs.rm(artifactPath, { recursive: true, force: true }).catch(() => {});
+    throw error;
+  } finally {
     await fs.rm(tempDir, { recursive: true, force: true }).catch(() => {});
   }
 }
@@ -827,6 +1441,31 @@ export async function executeRollback(options) {
     const releaseId = assertId(run.rollbackReleaseId, '回滚版本 ID');
     const artifactPath = path.join(config.dataDir, 'artifacts', project.id, releaseId);
     await validateStaticTree(artifactPath, signal);
+    if (backendEnabled(project)) {
+      const previousFrontend = await frontendBaseline(context, options.project.currentReleaseId);
+      const handle = await loadPhpBackendHandle(context, releaseId);
+      await assertUnifiedProof(artifactPath, handle);
+      const backend = {
+        application: handle.application,
+        sourceId: project.backend.sourceId,
+        phpVersion: handle.phpVersion,
+        status: 'running',
+        stage: 'rollback',
+      };
+      const onBackend = async (value) => {
+        Object.assign(backend, value);
+        await context.onMetadata({
+          buildDetails: { sources: [], tasks: [], backend: structuredClone(backend) },
+        });
+      };
+      const releasePath = await rollbackUnifiedRelease(context, {
+        handle,
+        artifactPath,
+        previousFrontend,
+        onBackend,
+      });
+      return { artifactPath, releasePath, buildDetails: { sources: [], tasks: [], backend } };
+    }
     await onStage('deploy');
     await onLog(`回滚到已保存的构建版本：${releaseId}\n`);
     const releasePath = await publish(artifactPath, project, releaseId, context);

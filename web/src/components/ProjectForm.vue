@@ -1,5 +1,7 @@
 <script setup>
 import { computed, ref, watch } from 'vue';
+import MultiBuildFields from './MultiBuildFields.vue';
+import { enableMultiBuild, setBackendEnabled } from '../lib/multi-build.js';
 import {
   Box,
   CheckCircle2,
@@ -13,6 +15,7 @@ import {
 } from '@lucide/vue';
 import { credentialLabel } from '../lib/format.js';
 import { matchesRepository } from '../lib/credentials.js';
+import { isAllowedHttpGitRepository } from '../../../shared/repository-policy.mjs';
 
 const form = defineModel({ type: Object, required: true });
 const props = defineProps({
@@ -39,7 +42,7 @@ watch(
     const selected = props.credentials.find(
       (credential) => credential.id === form.value.buildCredentialId,
     );
-    if (!selected || !matchesRepository(selected, form.value.repoUrl))
+    if (selected && !matchesRepository(selected, form.value.repoUrl))
       form.value.buildCredentialId = null;
   },
   { immediate: true },
@@ -49,10 +52,10 @@ watch(
   [() => form.value.deploy.credentialId, () => props.credentials],
   () => {
     if (!form.value.deploy.credentialId) return;
-    if (
-      !sshCredentials.value.some((credential) => credential.id === form.value.deploy.credentialId)
-    )
-      form.value.deploy.credentialId = null;
+    const selected = props.credentials.find(
+      (credential) => credential.id === form.value.deploy.credentialId,
+    );
+    if (selected && selected.type && selected.type !== 'ssh') form.value.deploy.credentialId = null;
   },
   { immediate: true },
 );
@@ -71,6 +74,10 @@ watch(
 
 function changeNode() {
   form.value.nodeVersion = nodeChoice.value === 'custom' ? '' : nodeChoice.value;
+}
+function selectSingleBuild() {
+  if (form.value.backend?.enabled) setBackendEnabled(form.value, false);
+  form.value.buildMode = 'single';
 }
 
 function changeManager() {
@@ -102,7 +109,9 @@ function changeManager() {
         >
           <Box :size="20" />
           <span>
-            <strong>Node.js 静态构建</strong>
+            <strong>{{
+              form.backend?.enabled ? '前端与 API 构建发布' : 'Node.js 静态构建'
+            }}</strong>
             <small>拉取代码、构建产物并发布</small>
           </span>
           <CheckCircle2 v-if="form.type !== 'command'" :size="16" />
@@ -156,6 +165,31 @@ function changeManager() {
         </div>
       </div>
       <div v-if="form.type !== 'command'" class="form-section">
+        <div class="segmented-control" aria-label="构建模式">
+          <button
+            type="button"
+            :class="{ active: form.buildMode !== 'multi' }"
+            @click="selectSingleBuild"
+          >
+            单任务构建
+          </button>
+          <button
+            type="button"
+            :class="{ active: form.buildMode === 'multi' }"
+            @click="enableMultiBuild(form)"
+          >
+            多任务构建
+          </button>
+        </div>
+        <small>多任务可构建 admin、H5、PC，并为同一业务配置 PHP 8.5 API 阶段。</small>
+      </div>
+      <MultiBuildFields
+        v-if="form.type !== 'command' && form.buildMode === 'multi'"
+        v-model="form"
+        :credentials="credentials"
+        :node-versions="nodeVersions"
+      />
+      <div v-if="form.type !== 'command' && form.buildMode !== 'multi'" class="form-section">
         <div class="form-section-title">
           <span>02</span>
           <h3>代码来源</h3>
@@ -172,6 +206,9 @@ function changeManager() {
               placeholder="git@github.com:team/project.git 或 HTTPS 地址"
             />
             <small>HTTPS 或 SSH 地址可选择对应仓库凭据，请勿在地址中填写密码或令牌。</small>
+            <small v-if="isAllowedHttpGitRepository(form.repoUrl.trim())">
+              此仓库使用 HTTP，传输未加密。请选择 Git 账号密码凭据，仅连接已批准的仓库地址。
+            </small>
           </label>
           <label class="field">
             <span>
@@ -182,8 +219,14 @@ function changeManager() {
           </label>
           <label class="field">
             仓库凭据
-            <select v-model="form.buildCredentialId" aria-label="仓库凭据">
-              <option :value="null">无需凭据 / 使用服务器现有配置</option>
+            <select
+              v-model="form.buildCredentialId"
+              aria-label="仓库凭据"
+              :required="isAllowedHttpGitRepository(form.repoUrl.trim())"
+            >
+              <option :value="null" :disabled="isAllowedHttpGitRepository(form.repoUrl.trim())">
+                无需凭据 / 使用服务器现有配置
+              </option>
               <option
                 v-for="credential in repositoryCredentials"
                 :key="credential.id"
@@ -195,7 +238,7 @@ function changeManager() {
           </label>
         </div>
       </div>
-      <div v-if="form.type !== 'command'" class="form-section">
+      <div v-if="form.type !== 'command' && form.buildMode !== 'multi'" class="form-section">
         <div class="form-section-title">
           <span>03</span>
           <h3>构建配置</h3>
@@ -414,7 +457,11 @@ function changeManager() {
           <label v-if="form.type !== 'command'" class="field">
             保留构建版本数
             <input v-model.number="form.retainReleases" type="number" required min="1" max="30" />
-            <small>保留的产物可用于后续回滚。</small>
+            <small>{{
+              form.backend?.enabled
+                ? '保留代码产物用于回滚；数据库、环境配置和上传数据单独保留。'
+                : '保留的产物可用于后续回滚。'
+            }}</small>
           </label>
         </div>
         <div v-if="form.type === 'command'" class="inline-notice">
@@ -423,7 +470,11 @@ function changeManager() {
         </div>
         <div v-else class="inline-notice">
           <Layers :size="16" />
-          每次成功构建生成独立版本，上传完成后再切换网站。
+          {{
+            form.backend?.enabled
+              ? '前端与 API 均检查成功后发布。代码回滚不会回退数据库、环境配置或上传数据。'
+              : '每次成功构建生成独立版本，上传完成后再切换网站。'
+          }}
         </div>
       </div>
     </div>

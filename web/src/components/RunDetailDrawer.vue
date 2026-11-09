@@ -19,6 +19,7 @@ import { date, executionDirectory } from '../lib/format.js';
 import { isCommand, runLabel, stageLabels } from '../lib/pipeline.js';
 import PipelineStages from './PipelineStages.vue';
 import StatusBadge from './StatusBadge.vue';
+import { backendApplications } from '../lib/multi-build.js';
 
 const props = defineProps({
   run: { type: Object, default: null },
@@ -31,6 +32,49 @@ defineEmits(['close', 'cancel', 'retry', 'copy']);
 
 const followLog = ref(true);
 const logElement = ref(null);
+const taskStatus = (task) =>
+  ({
+    waiting: '等待',
+    running: stageLabels[task.stage] || '构建中',
+    success: '成功',
+    failed: '失败',
+    cancelled: '已取消',
+    skipped: '已跳过',
+  })[task.status] || task.status;
+const backendStatus = (backend) => {
+  if (backend.stage === 'recovery_required') return '需核实恢复状态';
+  if (backend.stage === 'rolled_back') return '失败，已恢复先前版本';
+  if (backend.status === 'running')
+    return (
+      {
+        preflight: '检查 API 源码',
+        lint: 'PHP 语法检查',
+        archive: '保存 API 产物',
+        prepare: '准备 API 版本',
+        prepared: 'API 已准备',
+        'frontend-publish': '发布前端版本',
+        deploy: '上传 API',
+        activate: '切换 API',
+        rollback: '回退 API',
+      }[backend.stage] || '处理中'
+    );
+  return (
+    { waiting: '等待', success: '成功', failed: '失败', cancelled: '已取消', skipped: '已跳过' }[
+      backend.status
+    ] || '等待'
+  );
+};
+const backendVersion = (backend) =>
+  typeof backend.phpVersion === 'string' && /^8\.5(?:\.\d+)?$/.test(backend.phpVersion)
+    ? backend.phpVersion
+    : '8.5';
+const backendApplication = (backend) =>
+  backendApplications.includes(backend.application) ? backend.application : '待识别';
+const backendCommit = (backend) =>
+  typeof backend.sourceCommit === 'string' &&
+  /^[a-f0-9]{40}(?:[a-f0-9]{24})?$/.test(backend.sourceCommit)
+    ? backend.sourceCommit.slice(0, 12)
+    : '未记录';
 
 watch(
   () => props.run?.id,
@@ -105,8 +149,40 @@ watch(
         <PipelineStages v-if="run.kind !== 'rollback'" :run="run" />
         <div v-else class="inline-notice">
           <RotateCcw :size="16" />
-          使用历史产物发布，跳过依赖安装与构建。
+          {{
+            run.buildDetails?.backend
+              ? '使用历史前端与 API 代码产物回滚；数据库、环境配置和上传数据保持不变。'
+              : '使用历史产物发布，跳过依赖安装与构建。'
+          }}
         </div>
+
+        <section v-if="run.buildMode === 'multi'" class="multi-run-details">
+          <h3>
+            {{ run.sourceCount }} 个代码源 · {{ run.taskCount }} 个{{
+              run.buildDetails?.backend ? '前端任务 · API 阶段' : '构建任务'
+            }}
+          </h3>
+          <p v-if="!run.buildDetails">等待执行后显示各仓库提交和任务进度。</p>
+          <ul v-else>
+            <li v-for="source in run.buildDetails.sources" :key="source.id">
+              <strong>{{ source.name }}</strong> · {{ source.branch }} ·
+              <code>{{ source.commitSha?.slice(0, 12) || '等待拉取' }}</code>
+            </li>
+          </ul>
+          <div v-for="task in run.buildDetails?.tasks || []" :key="task.id" class="multi-run-task">
+            <strong>{{ task.name }}</strong
+            ><span>{{ taskStatus(task) }}</span>
+            <small>Node {{ task.nodeVersion || '待识别' }} · 发布到 {{ task.publishDir }}</small>
+          </div>
+          <div v-if="run.buildDetails?.backend" class="multi-run-task" aria-label="API 后端阶段">
+            <strong>API · PHP {{ backendVersion(run.buildDetails.backend) }}</strong>
+            <span>{{ backendStatus(run.buildDetails.backend) }}</span>
+            <small
+              >类型 PHP · 应用 {{ backendApplication(run.buildDetails.backend) }} · 提交
+              {{ backendCommit(run.buildDetails.backend) }}</small
+            >
+          </div>
+        </section>
 
         <section v-if="isCommand(run)" class="command-preview">
           <div>
@@ -173,7 +249,10 @@ watch(
         <span>
           运行 #{{ run.number }}
           <span class="dot-separator">·</span>
-          {{ stageLabels[run.stage] || run.stage }}
+          {{
+            stageLabels[run.stage] ||
+            (run.buildDetails?.backend ? backendStatus(run.buildDetails.backend) : run.stage)
+          }}
         </span>
         <div>
           <button class="button secondary" @click="$emit('close')">关闭</button>
@@ -200,3 +279,32 @@ watch(
     </section>
   </div>
 </template>
+
+<style scoped>
+.multi-run-details {
+  border: 1px solid var(--border, #e4ebf4);
+  border-radius: 12px;
+  padding: 16px;
+  margin: 20px 0;
+  font-size: 13px;
+}
+.multi-run-details h3 {
+  margin: 0 0 12px;
+  font-size: 14px;
+}
+.multi-run-details ul {
+  padding-left: 18px;
+  line-height: 1.8;
+}
+.multi-run-task {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 6px;
+  padding: 10px 0;
+  border-top: 1px solid var(--border, #e4ebf4);
+}
+.multi-run-task small {
+  grid-column: 1 / -1;
+  color: var(--text-muted, #7a8ca5);
+}
+</style>
